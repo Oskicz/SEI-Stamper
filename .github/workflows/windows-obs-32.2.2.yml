@@ -67,8 +67,13 @@ jobs:
         run: |
           $dll = Resolve-Path build-plugin/plugin/Release/sei-stamper.dll -ErrorAction Stop
           if ((Get-Item $dll).Length -eq 0) { throw 'The plugin DLL is empty.' }
-          $headers = dumpbin /headers $dll
-          if (($headers -join "`n") -notmatch '8664 machine \(x64\)') { throw 'The plugin DLL is not x64.' }
+          $dllBytes = [IO.File]::ReadAllBytes($dll)
+          $peOffset = [BitConverter]::ToInt32($dllBytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 6 -gt $dllBytes.Length -or [Text.Encoding]::ASCII.GetString($dllBytes, $peOffset, 4) -ne "PE`0`0") {
+            throw 'The plugin DLL has an invalid PE header.'
+          }
+          $machine = [BitConverter]::ToUInt16($dllBytes, $peOffset + 4)
+          if ($machine -ne 0x8664) { throw ('The plugin DLL is not x64 (machine 0x{0:X4}).' -f $machine) }
           $stage = Join-Path $env:RUNNER_TEMP 'sei-stamper-package'
           New-Item -ItemType Directory -Force "$stage/obs-plugins/64bit" | Out-Null
           New-Item -ItemType Directory -Force "$stage/data/obs-plugins/sei-stamper" | Out-Null
