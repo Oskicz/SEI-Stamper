@@ -10,6 +10,7 @@
 #include "ntp-client.h"
 #include "sei-handler.h"
 #include <libavcodec/avcodec.h> /* AVPacket */
+#include <libavutil/channel_layout.h>
 #include <obs-module.h>
 #include <util/threading.h> /* OBS threading API */
 
@@ -31,7 +32,7 @@ typedef enum {
 typedef struct video_frame_data {
   uint8_t *data;            /* frame data */
   size_t size;              /* data size */
-  int64_t pts;              /* presentation timestamp */
+  int64_t pts;              /* presentation timestamp in nanoseconds */
   ntp_timestamp_t ntp_time; /* NTP timestamp, extracted from the SEI */
   bool has_ntp;             /* whether an NTP timestamp is present */
   uint32_t width;           /* video width */
@@ -103,6 +104,10 @@ typedef struct sei_receiver_source {
   enum audio_format audio_format; /* OBS audio format */
   uint32_t audio_channels;        /* channel count */
   uint32_t audio_sample_rate;     /* sample rate */
+  void *audio_resampler;          /* SwrContext*: decoder -> OBS audio format */
+  int audio_resampler_sample_fmt;
+  int audio_resampler_sample_rate;
+  AVChannelLayout audio_resampler_layout;
 
   /* Statistics */
   uint64_t frames_received;       /* total frames received */
