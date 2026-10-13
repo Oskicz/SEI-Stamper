@@ -6,6 +6,7 @@
 ******************************************************************************/
 
 #include "sei-receiver-source.h"
+#include "receiver-time.h"
 #include <media-io/video-io.h>
 #include <obs-module.h>
 #include <util/platform.h>
@@ -16,6 +17,8 @@
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
 /* SRT Headers */
@@ -209,6 +212,7 @@ static bool reset_decoder(sei_receiver_source_t *source) {
 
     AVCodecContext *cctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(cctx, vstream->codecpar);
+    cctx->pkt_timebase = vstream->time_base;
 
     /* Reconfigure hardware decode */
     if (source->hw_decode_enabled && source->hw_device_ctx) {
@@ -395,25 +399,31 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     }
 
     sw_frame->pts = av_frame->pts;
+    sw_frame->best_effort_timestamp = av_frame->best_effort_timestamp;
     av_frame_free(&av_frame);
     av_frame = sw_frame;
   }
 
-  /* Take the PTS from the AVFrame (FFmpeg converted it from the packet) */
-  int64_t pts = av_frame->pts;
-  if (pts == AV_NOPTS_VALUE) {
-    /* With no PTS, use the current time */
-    pts = os_gettime_ns();
-  } else {
-    /* Convert the PTS from the stream timebase to nanoseconds */
-    AVRational time_base = {1, 90000}; // MPEG-TS normally uses 90 kHz
-    pts = av_rescale_q(pts, time_base, (AVRational){1, 1000000000});
-  }
+  /* AVFrame PTS retains the originating stream's time base. */
+  AVFormatContext *format_ctx = (AVFormatContext *)source->format_context;
+  AVRational video_time_base =
+      format_ctx->streams[source->video_stream_index]->time_base;
+  int64_t video_pts = av_frame->best_effort_timestamp;
+  if (video_pts == AV_NOPTS_VALUE)
+    video_pts = av_frame->pts;
+  if (video_pts == AV_NOPTS_VALUE)
+    video_pts = packet->pts;
+  int64_t pts_ns = video_pts;
+  if (pts_ns == AV_NOPTS_VALUE)
+    pts_ns = os_gettime_ns();
+  else
+    pts_ns = receiver_pts_to_ns(pts_ns, video_time_base.num,
+                                video_time_base.den);
 
   /* Fill in the frame info */
   frame_out->width = av_frame->width;
   frame_out->height = av_frame->height;
-  frame_out->pts = av_frame->pts;
+  frame_out->pts = pts_ns;
   frame_out->format = VIDEO_FORMAT_I420; /* YUV420P by default */
 
   /* Compute the frame size and allocate (align 32 for OBS) */
@@ -605,28 +615,25 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   return true;
 }
 
-/* Synchronised timestamp (PTS -> SystemTime) */
-int64_t get_sync_timestamp(sei_receiver_source_t *source, int64_t pts) {
+/* Synchronised timestamp (PTS nanoseconds -> OBS monotonic nanoseconds) */
+int64_t get_sync_timestamp(sei_receiver_source_t *source, int64_t pts_ns) {
   if (!source)
     return 0;
 
   int64_t current_time = os_gettime_ns();
 
-  /* PTS to ns: FFmpeg PTS is timebase-based; assume 90 kHz (SRT/MPEG-TS)
-   */
-  /* Take care if the PTS is already in ns (e.g. after AV_NOPTS_VALUE) */
-  /* callers normally pass an already-converted ns PTS */
+  /* All callers pass timestamps converted to nanoseconds. */
 
   if (!source->has_pts_offset) {
-    source->pts_offset = current_time - pts;
+    source->pts_offset = current_time - pts_ns;
     source->has_pts_offset = true;
 
     receiver_log(LOG_INFO, source,
                  "Initialized Sync Offset: PTS=%lld, Local=%lld, Offset=%lld",
-                 pts, current_time, source->pts_offset);
+                 pts_ns, current_time, source->pts_offset);
   }
 
-  return pts + source->pts_offset;
+  return pts_ns + source->pts_offset;
 }
 
 /* Compute the video presentation time */
@@ -639,23 +646,31 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
   /* With an NTP timestamp, and NTP sync enabled */
   if (frame->has_ntp && source->ntp_enabled) {
     /* Nanoseconds for the NTP timestamp */
-    uint64_t ntp_ns =
-        ((uint64_t)frame->ntp_time.seconds * 1000000000ULL) +
-        (((uint64_t)frame->ntp_time.fraction * 1000000000ULL) >> 32);
-
-    /* NTP mode: absolute-time sync */
-    /* Relies on the NTP client's global offset, not first-frame alignment */
-    /* Offset = NTP_Server - Local_System */
-    /* Local_Render_Time = Frame_NTP - Offset */
-
-    int64_t ntp_offset = ntp_client_get_offset(&source->ntp_client);
-    int64_t display_time = (int64_t)ntp_ns - ntp_offset;
+    /* Convert the absolute NTP stamp into OBS's monotonic timestamp domain
+     * using the NTP client's current server-time/monotonic-time anchor. */
+    ntp_timestamp_t current_ntp;
+    int64_t frame_ntp_ns, current_ntp_ns;
+    if (frame->ntp_time.seconds < 3786825600U ||
+        !ntp_client_get_time(&source->ntp_client, &current_ntp) ||
+        !receiver_ntp_to_unix_ns(frame->ntp_time.seconds,
+                                 frame->ntp_time.fraction, &frame_ntp_ns) ||
+        !receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
+                                 &current_ntp_ns) ||
+        frame_ntp_ns - current_ntp_ns > 86400000000000LL ||
+        current_ntp_ns - frame_ntp_ns > 86400000000000LL)
+      return get_sync_timestamp(source, frame->pts);
+    int64_t display_time;
+    if (!receiver_ntp_to_monotonic_ns(
+            frame->ntp_time.seconds, frame->ntp_time.fraction,
+            current_ntp.seconds, current_ntp.fraction,
+            (int64_t)os_gettime_ns(), &display_time))
+      return get_sync_timestamp(source, frame->pts);
 
     /* Log periodically only, to avoid flooding */
     if (source->sei_found_count % 300 == 0) {
       receiver_log(LOG_DEBUG, source,
-                   "Absolute Sync: NTP=%llu, Offset=%lld, Display=%lld", ntp_ns,
-                   ntp_offset, display_time);
+                   "Absolute Sync: NTP=%lld, LocalAnchor=%lld, Display=%lld",
+                   frame_ntp_ns, current_ntp_ns, display_time);
     }
 
     /* Update the shared PTS offset so audio follows the video's pacing */
@@ -705,11 +720,82 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
 
     struct obs_source_audio audio = {0};
     int channels = frame->ch_layout.nb_channels;
-    for (int i = 0; i < MAX_AUDIO_CHANNELS && i < channels; i++) {
-      audio.data[i] = frame->data[i];
+    if (channels <= 0 || channels > MAX_AUDIO_CHANNELS || frame->sample_rate <= 0) {
+      receiver_log(LOG_WARNING, source, "Unsupported decoded audio layout/rate");
+      av_frame_unref(frame);
+      continue;
     }
 
-    audio.frames = frame->nb_samples;
+    /* The decoder can return packed or planar samples in multiple formats.
+     * Always convert into the declared OBS format (float planar) so the data
+     * layout and sample type agree with audio.format. */
+    SwrContext *resampler = (SwrContext *)source->audio_resampler;
+    if (resampler &&
+        (source->audio_resampler_sample_fmt != frame->format ||
+         source->audio_resampler_sample_rate != frame->sample_rate ||
+         av_channel_layout_compare(&source->audio_resampler_layout,
+                                   &frame->ch_layout) != 0)) {
+      swr_free(&resampler);
+      source->audio_resampler = NULL;
+      av_channel_layout_uninit(&source->audio_resampler_layout);
+      resampler = NULL;
+    }
+    if (!resampler) {
+      AVChannelLayout output_layout = frame->ch_layout;
+      ret = swr_alloc_set_opts2(&resampler, &output_layout, AV_SAMPLE_FMT_FLTP,
+                                frame->sample_rate, &frame->ch_layout,
+                                (enum AVSampleFormat)frame->format,
+                                frame->sample_rate, 0, NULL);
+      if (ret >= 0)
+        ret = swr_init(resampler);
+      if (ret < 0) {
+        receiver_log(LOG_ERROR, source, "Failed to initialize audio conversion: %d", ret);
+        swr_free(&resampler);
+        source->audio_resampler = NULL;
+        success = false;
+        av_frame_unref(frame);
+        break;
+      }
+      source->audio_resampler = resampler;
+      source->audio_resampler_sample_fmt = frame->format;
+      source->audio_resampler_sample_rate = frame->sample_rate;
+      ret = av_channel_layout_copy(&source->audio_resampler_layout,
+                                   &frame->ch_layout);
+      if (ret < 0) {
+        swr_free(&resampler);
+        source->audio_resampler = NULL;
+        success = false;
+        av_frame_unref(frame);
+        break;
+      }
+    }
+
+    uint8_t **converted = NULL;
+    int converted_line_size = 0;
+    ret = av_samples_alloc_array_and_samples(&converted, &converted_line_size,
+                                              channels, frame->nb_samples,
+                                              AV_SAMPLE_FMT_FLTP, 0);
+    if (ret < 0) {
+      receiver_log(LOG_ERROR, source, "Failed to allocate converted audio: %d", ret);
+      success = false;
+      av_frame_unref(frame);
+      break;
+    }
+    int converted_samples = swr_convert(resampler, converted, frame->nb_samples,
+                                         (const uint8_t **)frame->extended_data,
+                                         frame->nb_samples);
+    if (converted_samples < 0) {
+      receiver_log(LOG_ERROR, source, "Audio sample conversion failed: %d", converted_samples);
+      av_freep(&converted[0]);
+      av_freep(&converted);
+      success = false;
+      av_frame_unref(frame);
+      break;
+    }
+
+    for (int i = 0; i < channels; i++)
+      audio.data[i] = converted[i];
+    audio.frames = (uint32_t)converted_samples;
 
     if (channels == 1)
       audio.speakers = SPEAKERS_MONO;
@@ -723,32 +809,36 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       audio.speakers = SPEAKERS_UNKNOWN;
 
     audio.format = source->audio_format;
-    audio.samples_per_sec = source->audio_sample_rate;
+    audio.samples_per_sec = (uint32_t)frame->sample_rate;
 
     /* Timestamp sync */
     /* Get the audio PTS (timebase-based) */
-    int64_t pts = frame->pts;
+    int64_t pts = frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE)
+      pts = frame->pts;
+    if (pts == AV_NOPTS_VALUE)
+      pts = packet->pts;
     int64_t pts_ns = 0;
 
     if (pts != AV_NOPTS_VALUE) {
-      AVRational tb = ctx->time_base;
-      /* If the timebase is 0, try 1/sample_rate */
-      if (tb.num == 0 || tb.den == 0) {
-        tb.num = 1;
-        tb.den = ctx->sample_rate;
-      }
-      pts_ns = av_rescale_q(pts, tb, (AVRational){1, 1000000000});
+      AVFormatContext *format_ctx = (AVFormatContext *)source->format_context;
+      AVRational tb = format_ctx->streams[source->audio_stream_index]->time_base;
+      if (tb.num <= 0 || tb.den <= 0)
+        tb = (AVRational){1, frame->sample_rate};
+      pts_ns = receiver_pts_to_ns(pts, tb.num, tb.den);
     } else {
-      /* With no PTS, derive it from the current offset */
-      pts_ns = (int64_t)audio.timestamp - source->pts_offset;
-      if (!source->has_pts_offset)
-        pts_ns = 0;
+      /* Keep un-timestamped audio on the established local clock. */
+      pts_ns = source->has_pts_offset ? (int64_t)os_gettime_ns() - source->pts_offset :
+                                      (int64_t)os_gettime_ns();
     }
 
     /* Use the shared timestamp sync */
     audio.timestamp = (uint64_t)get_sync_timestamp(source, pts_ns);
 
     obs_source_output_audio(source->context, &audio);
+    av_freep(&converted[0]);
+    av_freep(&converted);
+    av_frame_unref(frame);
   }
 
   av_frame_free(&frame);
@@ -1099,6 +1189,12 @@ static void cleanup_connection(sei_receiver_source_t *source) {
     avcodec_free_context((AVCodecContext **)&source->audio_codec_context);
     source->audio_codec_context = NULL;
   }
+  if (source->audio_resampler) {
+    SwrContext *resampler = (SwrContext *)source->audio_resampler;
+    swr_free(&resampler);
+    source->audio_resampler = NULL;
+  }
+  av_channel_layout_uninit(&source->audio_resampler_layout);
   source->is_connected = false;
   receiver_log(LOG_INFO, source, "Connection closed and resources freed");
 }
@@ -1213,6 +1309,9 @@ static bool try_connect(sei_receiver_source_t *source) {
                  "Applied stream parameters with manual codec override");
   }
 
+  /* Make decoder PTS and best-effort timestamps use the stream's time base. */
+  cctx->pkt_timebase = vstream->time_base;
+
   /* Configure hardware decode */
   if (source->hw_decode_enabled && source->hw_device_ctx) {
     cctx->hw_device_ctx = av_buffer_ref((AVBufferRef *)source->hw_device_ctx);
@@ -1257,27 +1356,14 @@ static bool try_connect(sei_receiver_source_t *source) {
     if (acodec) {
       AVCodecContext *actx = avcodec_alloc_context3(acodec);
       avcodec_parameters_to_context(actx, astream->codecpar);
+      actx->pkt_timebase = astream->time_base;
       if (avcodec_open2(actx, acodec, NULL) >= 0) {
         source->audio_codec_context = actx;
         source->audio_stream_index = audio_idx;
-        /* Audio format mapping simplified for brevity, assume valid */
         source->audio_channels = actx->ch_layout.nb_channels;
         source->audio_sample_rate = actx->sample_rate;
-        source->audio_format = AUDIO_FORMAT_FLOAT_PLANAR; /* Default safe */
-
-        switch (actx->sample_fmt) {
-        case AV_SAMPLE_FMT_S16:
-          source->audio_format = AUDIO_FORMAT_16BIT;
-          break;
-        case AV_SAMPLE_FMT_S16P:
-          source->audio_format = AUDIO_FORMAT_16BIT_PLANAR;
-          break;
-        case AV_SAMPLE_FMT_FLT:
-          source->audio_format = AUDIO_FORMAT_FLOAT;
-          break;
-        default:
-          break;
-        }
+        /* decode_audio always converts into this OBS sample layout. */
+        source->audio_format = AUDIO_FORMAT_FLOAT_PLANAR;
 
         receiver_log(LOG_INFO, source, "Audio stream opened (idx: %d)",
                      audio_idx);

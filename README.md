@@ -107,6 +107,8 @@ cmake --install build --config Release --prefix out/obs-studio
 
 The DLL is `build/plugin/Release/sei-stamper.dll`; the installable tree is `out/obs-studio/`. CMake installation stages only the plugin and `data/`, not SRT or other runtime dependencies.
 
+The GitHub Actions workflow `.github/workflows/windows-obs-32.2.2.yml` builds against the OBS **32.2.2 source tag** and its pinned `2026-07-15` dependency bundle, runs the standalone timestamp and sample-conversion tests, checks the x64 DLL, and uploads `sei-stamper-windows-obs-32.2.2-x64.zip` as a 90-day Actions artifact. Open the successful run's **Artifacts** section to download the ZIP. The tests use synthetic timestamps and audio samples; they do not exercise live playback or GPU encoding.
+
 Alternatively, from the project root:
 
 ```powershell
@@ -125,7 +127,7 @@ Run from the project root:
 .\tests\run_tests.bat
 ```
 
-The local run on **2026-09-05 passed 60 checks with 0 failures**. These cover NTP conversion and sync anchoring, SEI payload layout, NAL scanning and extradata conversion. The test file copies pure functions instead of linking production sources; it does not test NTP networking, threads, OBS loading, GPUs or multi-stream synchronization. (Sources: [runner](tests/run_tests.bat), [test implementation](tests/test_ntp_sei.c).)
+The standalone checks cover NTP conversion and sync anchoring, PTS conversion for 48 kHz and 90 kHz streams, NTP-to-monotonic mapping, SEI payload layout, NAL scanning and extradata conversion. A separate FFmpeg `libswresample` test verifies packed S16 samples become planar float samples. These tests need no hardware encoder or audio device. They do not test NTP networking, OBS loading, GPU encoding, multi-stream SRT or actual audio playback. (Sources: [runner](tests/run_tests.bat), [pure-function tests](tests/test_ntp_sei.c), [sample conversion test](tests/test_audio_conversion.c), [workflow](.github/workflows/windows-obs-32.2.2.yml).)
 
 On the same date, the 1.3.0 Windows x64 Release build passed using MSVC 19.50 / CMake 4.2.1 / Ninja. DLL loading, `obs_module_ver()` and SRT protocol lookup passed against the official OBS 32.2.2 portable runtime. This package uses official 32.2.2 headers and OBS/pthread import libraries generated from that version's DLL exports. OBS plugin initialization, GPU processing and streaming were not tested. (Source: build record included in the [v1.3.0 release assets](https://github.com/ikenainanodesu/SEI-Stamper/releases/tag/v1.3.0).)
 

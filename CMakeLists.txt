@@ -125,8 +125,24 @@ target_link_libraries(sei-stamper
     "${FFMPEG_LIB_DIR}/avcodec.lib"
     "${FFMPEG_LIB_DIR}/avformat.lib"
     "${FFMPEG_LIB_DIR}/avutil.lib"
+    "${FFMPEG_LIB_DIR}/swresample.lib"
     "${FFMPEG_LIB_DIR}/swscale.lib"
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(sei-core-tests tests/test_ntp_sei.c)
+    target_include_directories(sei-core-tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME sei-core-tests COMMAND sei-core-tests)
+
+    add_executable(sei-audio-conversion-tests tests/test_audio_conversion.c)
+    target_include_directories(sei-audio-conversion-tests PRIVATE ${OBS_DEPS_DIR}/include)
+    target_link_libraries(sei-audio-conversion-tests
+        "${FFMPEG_LIB_DIR}/swresample.lib"
+        "${FFMPEG_LIB_DIR}/avutil.lib"
+    )
+    add_test(NAME sei-audio-conversion-tests COMMAND sei-audio-conversion-tests)
+endif()
 
 # --- x264 ---
 set(X264_LIBRARY "${OBS_DEPS_DIR}/lib/libx264.lib")
@@ -158,6 +174,7 @@ find_library(SRT_LIBRARY NAMES srt libsrt
     "${CMAKE_SOURCE_DIR}/srt/_build/Release"
     "${OBS_BUILD_DIR}/rundir/Release/bin/64bit"
     "${OBS_SOURCE_DIR}/plugins/obs-outputs"
+    "${OBS_DEPS_DIR}/lib"
 )
 if(SRT_LIBRARY)
     message(STATUS "Found SRT: ${SRT_LIBRARY}")
