@@ -12,6 +12,15 @@ int main(void)
   if (multicam_status_snapshot(&measured, 1) != 1 ||
       measured.rx_bitrate_bps != 16000 || measured.rx_bitrate_5s_bps != 16000 || !measured.has_audio ||
       measured.connected == false) return 7;
+  multicam_status_video(&key, MULTICAM_SYNC_MOBLIN_TIMECODE, true,
+                        900000000000LL, 550000000ULL, 1920, 1080, 0,
+                        2000000000ULL);
+  multicam_status_set_srt_latency(&key, 3200);
+  if (multicam_status_snapshot(&measured, 1) != 1 ||
+      measured.observed_latency_ns != 550000000ULL ||
+      measured.srt_rcvlatency_ms != 3200 ||
+      multicam_status_max_observed_latency_ns(2000000000ULL) != 550000000ULL)
+    return 9;
   multicam_status_set_connection(&key, false, NULL, false, 0, 0);
   if (multicam_status_snapshot(&measured, 1) != 1 || measured.connected ||
       measured.rx_bitrate_bps || measured.last_video_mono_ns) return 8;
