@@ -17,6 +17,7 @@ typedef struct status_slot {
 
 static pthread_mutex_t status_lock = PTHREAD_MUTEX_INITIALIZER;
 static status_slot_t slots[MULTICAM_STATUS_MAX_SOURCES];
+static bool is_recent(uint64_t stamp, uint64_t now_ns);
 
 static status_slot_t *find_slot(void *key)
 {
@@ -113,6 +114,7 @@ void multicam_status_add_packet(void *key, size_t bytes, uint64_t now_ns)
 
 void multicam_status_video(void *key, multicam_status_sync_method_t method,
                            bool ntp_fresh, int64_t absolute_unix_ns,
+                           uint64_t observed_latency_ns,
                            uint32_t width, uint32_t height,
                            int64_t video_offset_ns, uint64_t now_ns)
 {
@@ -124,6 +126,7 @@ void multicam_status_video(void *key, multicam_status_sync_method_t method,
     slot->value.sync_method = method;
     slot->value.ntp_fresh = ntp_fresh;
     slot->value.last_absolute_unix_ns = absolute_unix_ns > 0 ? (uint64_t)absolute_unix_ns : 0;
+    slot->value.observed_latency_ns = ntp_fresh ? observed_latency_ns : 0;
     slot->value.width = width;
     slot->value.height = height;
     slot->value.video_offset_ns = video_offset_ns;
@@ -140,6 +143,31 @@ void multicam_status_video(void *key, multicam_status_sync_method_t method,
     }
   }
   pthread_mutex_unlock(&status_lock);
+}
+
+void multicam_status_set_srt_latency(void *key, uint32_t latency_ms)
+{
+  pthread_mutex_lock(&status_lock);
+  status_slot_t *slot = find_slot(key);
+  if (slot)
+    slot->value.srt_rcvlatency_ms = latency_ms;
+  pthread_mutex_unlock(&status_lock);
+}
+
+uint64_t multicam_status_max_observed_latency_ns(uint64_t now_ns)
+{
+  uint64_t maximum = 0;
+  pthread_mutex_lock(&status_lock);
+  for (size_t i = 0; i < MULTICAM_STATUS_MAX_SOURCES; ++i) {
+    const multicam_source_status_t *value = &slots[i].value;
+    if (slots[i].key && value->connected && value->ntp_fresh &&
+        is_recent(value->last_video_mono_ns, now_ns) &&
+        value->last_absolute_unix_ns > 0 &&
+        value->observed_latency_ns > maximum)
+      maximum = value->observed_latency_ns;
+  }
+  pthread_mutex_unlock(&status_lock);
+  return maximum;
 }
 
 void multicam_status_audio(void *key, uint64_t now_ns)
