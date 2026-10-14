@@ -251,8 +251,12 @@ static bool ntp_sync_one_addr(ntp_client_t *client, struct addrinfo *ai,
   uint64_t t3_ns = ntp_to_ns(&t3);
 
   /* Standard NTP offset, on wall-clock time so it shares the server's base. */
-  int64_t offset = ((int64_t)(t2_ns - t1_wall) + (int64_t)(t3_ns - t4_wall)) / 2;
-  int64_t delay = (int64_t)(t4_wall - t1_wall) - (int64_t)(t3_ns - t2_ns);
+  /* Convert each operand before subtracting. Unsigned subtraction followed by
+   * a signed cast depends on implementation behavior when the clocks differ. */
+  int64_t offset = (((int64_t)t2_ns - (int64_t)t1_wall) +
+                    ((int64_t)t3_ns - (int64_t)t4_wall)) / 2;
+  int64_t delay = ((int64_t)t4_wall - (int64_t)t1_wall) -
+                  ((int64_t)t3_ns - (int64_t)t2_ns);
 
   /* Anchor at T4 + offset (== T3 + delay/2): raw T3 sits half a round trip in
    * the past, a per-network-path skew between encoders. */
