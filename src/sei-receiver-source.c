@@ -1345,14 +1345,17 @@ static bool try_connect(sei_receiver_source_t *source) {
 
   /* Set a timeout so it cannot block for long */
   AVDictionary *options = NULL;
-  av_dict_set(&options, "timeout", "2000000", 0); /* 2 s timeout */
+  int64_t open_timeout_us = 2000000;
   if (source->srt_rcvlatency_ms > 120) {
+    open_timeout_us = (int64_t)source->srt_rcvlatency_ms * 1000 + 2000000;
     av_dict_set_int(&options, "rcvlatency",
                     (int64_t)source->srt_rcvlatency_ms * 1000, 0);
     receiver_log(LOG_INFO, source,
                  "Opening SRT input with requested receive latency %u ms",
                  source->srt_rcvlatency_ms);
   }
+
+  av_dict_set_int(&options, "timeout", open_timeout_us, 0);
 
   /* Use the configured SRT URL as-is (it may carry ?streamid=xxx etc.) */
   if (avformat_open_input(&fmt_ctx, source->srt_url, NULL, &options) < 0) {
