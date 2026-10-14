@@ -7,6 +7,8 @@
 
 #include "sei-receiver-source.h"
 #include "receiver-time.h"
+#include "moblin-timecode.h"
+#include "multicam-status.h"
 #include <media-io/video-io.h>
 #include <obs-module.h>
 #include <util/platform.h>
@@ -298,6 +300,14 @@ static bool init_hw_device(sei_receiver_source_t *source) {
  *============================================================================*/
 
 /* Decode and extract the SEI */
+static void record_decode_error(sei_receiver_source_t *source)
+{
+  if (!source)
+    return;
+  source->decode_errors_total++;
+  multicam_status_set_decode_errors(source, source->decode_errors_total);
+}
+
 bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                             video_frame_data_t *frame_out) {
   if (!source || !packet || !frame_out) {
@@ -317,6 +327,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   if (ret < 0) {
     receiver_log(LOG_ERROR, source, "Failed to send packet to decoder: %d (%s)",
                  ret, av_err2str(ret));
+    record_decode_error(source);
     return false;
   }
 
@@ -327,6 +338,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   /* Receive the decoded frame */
   AVFrame *av_frame = av_frame_alloc();
   if (!av_frame) {
+    record_decode_error(source);
     return false;
   }
 
@@ -358,6 +370,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
 
     /* Error recovery: bump the error count */
     source->decode_error_count++;
+    record_decode_error(source);
     if (source->decode_error_count >= source->decode_error_threshold) {
       receiver_log(LOG_WARNING, source,
                    "Decoder error threshold reached (%u), attempting reset",
@@ -486,8 +499,9 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                    "Extracted NTP SEI: seconds=%u, fraction=%u",
                    ntp_data.ntp_time.seconds, ntp_data.ntp_time.fraction);
     }
-  } else {
-    /* If the side data has none, look in the raw data */
+  }
+  if (!frame_out->has_ntp) {
+    /* FFmpeg does not expose HEVC time_code as unregistered user data. */
     const uint8_t *payload = NULL;
     size_t payload_size = 0;
 
@@ -502,76 +516,41 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     }
   }
 
-  /* NTP sync policy:
-   * 1. Sync on a keyframe (IDR) that carries an SEI timestamp
-   * 2. Sync when local time differs from NTP time by over 50 ms
-   */
   if (frame_out->has_ntp && source->ntp_enabled) {
-    bool should_sync = false;
-    uint64_t now = os_gettime_ns();
-
-    /* Condition 1: keyframe sync, with a 10 s minimum gap */
-    bool is_keyframe = (av_frame->flags & AV_FRAME_FLAG_KEY) != 0;
-
-    /* Time since the last sync*/
-    uint64_t time_since_last_sync = 0;
-    if (source->last_ntp_sync_time > 0) {
-      time_since_last_sync = now - source->last_ntp_sync_time;
-    }
-
-    /* Use the configured minimum sync interval */
-    uint64_t min_interval_ns =
-        (uint64_t)source->ntp_sync_interval_ms * 1000000ULL;
-
-    if (is_keyframe && time_since_last_sync >= min_interval_ns) {
-      should_sync = true;
-      receiver_log(LOG_DEBUG, source,
-                   "Keyframe + interval met, triggering NTP sync");
-    }
-
-    /* Condition 2: drift detection, also bounded by the minimum gap */
-    if (!should_sync && source->ntp_client.is_synced &&
-        time_since_last_sync >= min_interval_ns) {
-      /* Nanoseconds for this frame's NTP timestamp */
-      uint64_t frame_ntp_ns =
-          ((uint64_t)frame_out->ntp_time.seconds * 1000000000ULL) +
-          (((uint64_t)frame_out->ntp_time.fraction * 1000000000ULL) >> 32);
-
-      /* NTP time for the current local time */
+    source->sync_method = SYNC_METHOD_SEI_STAMPER_NTP;
+  } else {
+    source->sync_method = SYNC_METHOD_PTS_FALLBACK;
+    AVFormatContext *format_ctx = (AVFormatContext *)source->format_context;
+    moblin_timecode_t moblin_tc;
+    if (!frame_out->has_ntp && source->ntp_enabled && format_ctx &&
+        source->video_stream_index >= 0 &&
+        codec_ctx->codec_id == AV_CODEC_ID_HEVC &&
+        moblin_extract_timecode_annexb(packet->data, packet->size,
+                                       &moblin_tc)) {
       ntp_timestamp_t current_ntp;
-      if (ntp_client_get_time(&source->ntp_client, &current_ntp)) {
-        uint64_t current_ntp_ns =
-            ((uint64_t)current_ntp.seconds * 1000000000ULL) +
-            (((uint64_t)current_ntp.fraction * 1000000000ULL) >> 32);
-
-        /* Compute the difference */
-        int64_t time_diff = (int64_t)(frame_ntp_ns - current_ntp_ns);
-        if (time_diff < 0)
-          time_diff = -time_diff; // absolute value
-
-        /* Use the configured drift threshold */
-        uint64_t drift_threshold_ns =
-            (uint64_t)source->ntp_drift_threshold_ms * 1000000ULL;
-        if (time_diff > (int64_t)drift_threshold_ns) {
-          should_sync = true;
-          receiver_log(LOG_DEBUG, source,
-                       "Time drift detected: %lld ms, triggering NTP sync",
-                       time_diff / 1000000);
-        }
-      }
-    }
-
-    /* Perform the NTP sync */
-    if (should_sync) {
-      /* Update the time either way: a network fault must not retry every frame
-       */
-      source->last_ntp_sync_time = now;
-
-      if (ntp_client_sync(&source->ntp_client)) {
-        receiver_log(LOG_INFO, source, "NTP synchronized (syncs: %u)",
-                     source->ntp_client.sync_count);
-      } else {
-        receiver_log(LOG_WARNING, source, "NTP sync failed");
+      int64_t current_unix_ns, mapped_unix_ns;
+      AVStream *stream = format_ctx->streams[source->video_stream_index];
+      AVRational fps = av_guess_frame_rate(format_ctx, stream, av_frame);
+      /* A fresh local NTP anchor supplies the missing calendar date. With no
+       * trustworthy anchor or frame rate, retain the explicit PTS fallback. */
+      uint32_t ntp_max_age =
+          receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms);
+      if (!ntp_client_needs_resync(&source->ntp_client, ntp_max_age) &&
+          ntp_client_get_time(&source->ntp_client, &current_ntp) &&
+          receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
+                                  &current_unix_ns) &&
+          moblin_timecode_resolve_unix_ns(&moblin_tc, current_unix_ns,
+                                          fps.num, fps.den,
+                                          &mapped_unix_ns)) {
+        uint64_t unix_seconds = (uint64_t)(mapped_unix_ns / 1000000000LL);
+        uint64_t fraction_ns = (uint64_t)(mapped_unix_ns % 1000000000LL);
+        frame_out->ntp_time.seconds =
+            (uint32_t)(unix_seconds + 2208988800ULL);
+        frame_out->ntp_time.fraction =
+            (uint32_t)((fraction_ns << 32) / 1000000000ULL);
+        frame_out->has_ntp = true;
+        source->sync_method = SYNC_METHOD_MOBLIN_TIMECODE;
+        source->sei_found_count++;
       }
     }
   }
@@ -588,6 +567,27 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
 
   /* Calculate correct Sync Timestamp */
   obs_frame.timestamp = calculate_display_time(source, frame_out);
+
+  int64_t absolute_unix_ns = 0;
+  bool ntp_fresh = false;
+  multicam_status_sync_method_t status_method = MULTICAM_SYNC_PTS_FALLBACK;
+  if (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP)
+    status_method = MULTICAM_SYNC_SEI_STAMPER_NTP;
+  else if (source->sync_method == SYNC_METHOD_MOBLIN_TIMECODE)
+    status_method = MULTICAM_SYNC_MOBLIN_TIMECODE;
+  if (status_method == MULTICAM_SYNC_SEI_STAMPER_NTP ||
+      status_method == MULTICAM_SYNC_MOBLIN_TIMECODE) {
+    ntp_fresh = !ntp_client_needs_resync(
+        &source->ntp_client,
+        receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
+    if (ntp_fresh)
+      receiver_ntp_to_unix_ns(frame_out->ntp_time.seconds,
+                              frame_out->ntp_time.fraction,
+                              &absolute_unix_ns);
+  }
+  multicam_status_video(source, status_method, ntp_fresh, absolute_unix_ns,
+                        frame_out->width, frame_out->height, source->pts_offset,
+                        os_gettime_ns());
 
   /* Debug log: confirm the timestamp */
   receiver_log(
@@ -644,7 +644,10 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
   }
 
   /* With an NTP timestamp, and NTP sync enabled */
-  if (frame->has_ntp && source->ntp_enabled) {
+  if (frame->has_ntp && source->ntp_enabled &&
+      !ntp_client_needs_resync(
+          &source->ntp_client,
+          receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms))) {
     /* Nanoseconds for the NTP timestamp */
     /* Convert the absolute NTP stamp into OBS's monotonic timestamp domain
      * using the NTP client's current server-time/monotonic-time anchor. */
@@ -657,14 +660,18 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
         !receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
                                  &current_ntp_ns) ||
         frame_ntp_ns - current_ntp_ns > 86400000000000LL ||
-        current_ntp_ns - frame_ntp_ns > 86400000000000LL)
+        current_ntp_ns - frame_ntp_ns > 86400000000000LL) {
+      source->sync_method = SYNC_METHOD_PTS_FALLBACK;
       return get_sync_timestamp(source, frame->pts);
+    }
     int64_t display_time;
     if (!receiver_ntp_to_monotonic_ns(
             frame->ntp_time.seconds, frame->ntp_time.fraction,
             current_ntp.seconds, current_ntp.fraction,
-            (int64_t)os_gettime_ns(), &display_time))
+            (int64_t)os_gettime_ns(), &display_time)) {
+      source->sync_method = SYNC_METHOD_PTS_FALLBACK;
       return get_sync_timestamp(source, frame->pts);
+    }
 
     /* Log periodically only, to avoid flooding */
     if (source->sei_found_count % 300 == 0) {
@@ -688,6 +695,7 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
   }
 
   /* No NTP, or disabled: fall back to plain PTS sync */
+  source->sync_method = SYNC_METHOD_PTS_FALLBACK;
   return get_sync_timestamp(source, frame->pts);
 }
 
@@ -700,12 +708,16 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
   int ret = avcodec_send_packet(ctx, packet);
   if (ret < 0) {
     receiver_log(LOG_ERROR, source, "Error sending audio packet: %d", ret);
+    record_decode_error(source);
     return false;
   }
 
   AVFrame *frame = av_frame_alloc();
   if (!frame)
+  {
+    record_decode_error(source);
     return false;
+  }
 
   bool success = true;
   while (ret >= 0) {
@@ -714,6 +726,7 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       break;
     } else if (ret < 0) {
       receiver_log(LOG_ERROR, source, "Error receiving audio frame: %d", ret);
+      record_decode_error(source);
       success = false;
       break;
     }
@@ -750,6 +763,7 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
         ret = swr_init(resampler);
       if (ret < 0) {
         receiver_log(LOG_ERROR, source, "Failed to initialize audio conversion: %d", ret);
+        record_decode_error(source);
         swr_free(&resampler);
         source->audio_resampler = NULL;
         success = false;
@@ -777,6 +791,7 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
                                               AV_SAMPLE_FMT_FLTP, 0);
     if (ret < 0) {
       receiver_log(LOG_ERROR, source, "Failed to allocate converted audio: %d", ret);
+      record_decode_error(source);
       success = false;
       av_frame_unref(frame);
       break;
@@ -786,6 +801,7 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
                                          frame->nb_samples);
     if (converted_samples < 0) {
       receiver_log(LOG_ERROR, source, "Audio sample conversion failed: %d", converted_samples);
+      record_decode_error(source);
       av_freep(&converted[0]);
       av_freep(&converted);
       success = false;
@@ -833,9 +849,14 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
     }
 
     /* Use the shared timestamp sync */
-    audio.timestamp = (uint64_t)get_sync_timestamp(source, pts_ns);
+    pthread_mutex_lock(&source->audio_settings_lock);
+    int64_t audio_offset_ns = source->audio_offset_ns;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+    audio.timestamp = receiver_audio_timestamp_with_offset(
+        get_sync_timestamp(source, pts_ns), audio_offset_ns);
 
     obs_source_output_audio(source->context, &audio);
+    multicam_status_audio(source, os_gettime_ns());
     av_freep(&converted[0]);
     av_freep(&converted);
     av_frame_unref(frame);
@@ -875,6 +896,13 @@ static void *receiver_source_create(obs_data_t *settings,
     bfree(ctx);
     return NULL;
   }
+  if (pthread_mutex_init(&ctx->audio_settings_lock, NULL) != 0) {
+    frame_buffer_destroy(&ctx->frame_buffer);
+    bfree(ctx);
+    return NULL;
+  }
+  ctx->audio_settings_lock_initialized = true;
+  multicam_status_register(ctx, obs_source_get_name(source));
 
   /* Initialise the sync state */
   ctx->sync_state = SYNC_STATE_WAITING;
@@ -929,6 +957,10 @@ static void *receiver_source_create(obs_data_t *settings,
   if (ctx->ntp_sync_interval_ms == 0) {
     ctx->ntp_sync_interval_ms = 10000; // default 10 s, to be safe
   }
+  ctx->audio_offset_ns =
+      (int64_t)obs_data_get_int(settings, "audio_offset_ms") * 1000000LL;
+  multicam_status_set_audio_offset(
+      ctx, (int32_t)(ctx->audio_offset_ns / 1000000LL));
 
   /* Initialise statistics and error recovery */
   ctx->last_stats_update_time = 0;
@@ -942,12 +974,9 @@ static void *receiver_source_create(obs_data_t *settings,
   if (ctx->ntp_enabled) {
     if (ntp_client_init(&ctx->ntp_client, ctx->ntp_server, ctx->ntp_port)) {
       receiver_log(LOG_INFO, ctx, "NTP client initialized");
-
-      /* Do the initial sync */
-      if (ntp_client_sync(&ctx->ntp_client)) {
-        ctx->last_ntp_sync_time = os_gettime_ns();
-        receiver_log(LOG_INFO, ctx, "Initial NTP sync successful");
-      }
+      /* Resolve DNS and sync only on the NTP worker, never in OBS or decode. */
+      ntp_client_start_background_sync(&ctx->ntp_client,
+                                       ctx->ntp_sync_interval_ms);
     }
   }
 
@@ -965,6 +994,7 @@ static void receiver_source_destroy(void *data) {
 
   /* Stop the receiver */
   stop_receiver(ctx);
+  multicam_status_unregister(ctx);
 
   /* avformat owns the SRT connection; no manual socket close */
 
@@ -986,6 +1016,10 @@ static void receiver_source_destroy(void *data) {
 
   /* Destroy the frame buffer */
   frame_buffer_destroy(&ctx->frame_buffer);
+  if (ctx->audio_settings_lock_initialized) {
+    pthread_mutex_destroy(&ctx->audio_settings_lock);
+    ctx->audio_settings_lock_initialized = false;
+  }
 
   /* Free the SwsContext */
   if (ctx->sws_ctx) {
@@ -1013,6 +1047,7 @@ static void receiver_source_defaults(obs_data_t *settings) {
   obs_data_set_default_int(settings, "ntp_drift_threshold", 50); // 50 ms
   obs_data_set_default_int(settings, "ntp_sync_interval",
                            10000); // default 10000 ms (10 s)
+  obs_data_set_default_int(settings, "audio_offset_ms", 0);
 }
 
 /* Properties */
@@ -1066,12 +1101,15 @@ static obs_properties_t *receiver_source_properties(void *data) {
                          10); // 10 ms to 1000 ms
 
   obs_properties_add_int(props, "ntp_sync_interval", "NTP Sync Interval (ms)",
-                         100, 3600000, 100); // 100 ms to 1 hour
+                         1000, 3600000, 1000); // 1 s to 1 hour
+
+  obs_properties_add_int(props, "audio_offset_ms",
+                         "Audio offset relative to video (ms)", -500, 500, 1);
 
   /* Warning text */
   obs_properties_add_text(props, "ntp_interval_warning",
-                          "⚠️ Warning: Setting interval < 1000ms may cause "
-                          "stuttering on slow networks.",
+                          "NTP networking runs on a worker; failed requests "
+                          "use retry backoff.",
                           OBS_TEXT_INFO);
 
   /* Status info (read-only) */
@@ -1089,6 +1127,16 @@ static obs_properties_t *receiver_source_properties(void *data) {
 static void receiver_source_update(void *data, obs_data_t *settings) {
   sei_receiver_source_t *ctx = (sei_receiver_source_t *)data;
 
+  int64_t audio_offset_ns =
+      (int64_t)obs_data_get_int(settings, "audio_offset_ms") * 1000000LL;
+  pthread_mutex_lock(&ctx->audio_settings_lock);
+  bool audio_offset_changed = ctx->audio_offset_ns != audio_offset_ns;
+  ctx->audio_offset_ns = audio_offset_ns;
+  pthread_mutex_unlock(&ctx->audio_settings_lock);
+  if (audio_offset_changed) {
+    multicam_status_set_audio_offset(ctx, (int32_t)(audio_offset_ns / 1000000LL));
+  }
+
   bool settings_changed = false;
 
   /* Update the SRT URL */
@@ -1101,25 +1149,39 @@ static void receiver_source_update(void *data, obs_data_t *settings) {
     settings_changed = true;
   }
 
-  /* Update the NTP settings */
+  /* NTP settings may change while the receiver thread reads the clock. Stop
+   * that reader before changing its snapshot. Updating the worker is local and
+   * never joins it or performs DNS/socket I/O on OBS's UI thread. */
   bool ntp_enabled = obs_data_get_bool(settings, "ntp_enabled");
-  if (ntp_enabled != ctx->ntp_enabled) {
+  const char *configured_ntp_server = obs_data_get_string(settings, "ntp_server");
+  const char *ntp_server = configured_ntp_server && configured_ntp_server[0]
+                               ? configured_ntp_server : "time.windows.com";
+  uint16_t ntp_port = (uint16_t)obs_data_get_int(settings, "ntp_port");
+  if (!ntp_port) ntp_port = 123;
+  uint32_t ntp_interval = (uint32_t)obs_data_get_int(settings, "ntp_sync_interval");
+  if (!ntp_interval) ntp_interval = 10000;
+  if (ntp_enabled != ctx->ntp_enabled || strcmp(ntp_server, ctx->ntp_server) != 0 ||
+      ntp_port != ctx->ntp_port || ntp_interval != ctx->ntp_sync_interval_ms) {
+    stop_receiver(ctx);
     ctx->ntp_enabled = ntp_enabled;
-
-    if (ntp_enabled) {
-      const char *ntp_server = obs_data_get_string(settings, "ntp_server");
-      uint16_t ntp_port = (uint16_t)obs_data_get_int(settings, "ntp_port");
-
-      if (ntp_client_init(&ctx->ntp_client, ntp_server, ntp_port)) {
-        if (ntp_client_sync(&ctx->ntp_client)) {
-          ctx->last_ntp_sync_time = os_gettime_ns();
-          receiver_log(LOG_INFO, ctx, "NTP enabled and synchronized");
-        }
-      }
-    } else {
-      ntp_client_destroy(&ctx->ntp_client);
-      receiver_log(LOG_INFO, ctx, "NTP disabled");
+    strncpy(ctx->ntp_server, ntp_server, sizeof(ctx->ntp_server) - 1);
+    ctx->ntp_port = ntp_port;
+    ctx->ntp_sync_interval_ms = ntp_interval;
+    ctx->has_pts_offset = false;
+    ctx->sync_method = SYNC_METHOD_UNKNOWN;
+    if (ctx->ntp_client.is_initialized) {
+      ntp_client_update_settings(&ctx->ntp_client, ctx->ntp_server,
+                                 ctx->ntp_port, ntp_interval, ntp_enabled);
+      if (ntp_enabled && !ctx->ntp_client.sync_thread_active)
+        ntp_client_start_background_sync(&ctx->ntp_client, ntp_interval);
+    } else if (ntp_enabled &&
+               ntp_client_init(&ctx->ntp_client, ctx->ntp_server,
+                               ctx->ntp_port)) {
+      ntp_client_start_background_sync(&ctx->ntp_client, ntp_interval);
     }
+    receiver_log(LOG_INFO, ctx, "NTP worker settings updated (enabled: %s)",
+                 ntp_enabled ? "yes" : "no");
+    settings_changed = true;
   }
 
   /* Update the hardware decoder settings */
@@ -1196,6 +1258,12 @@ static void cleanup_connection(sei_receiver_source_t *source) {
   }
   av_channel_layout_uninit(&source->audio_resampler_layout);
   source->is_connected = false;
+  source->has_pts_offset = false;
+  source->pts_offset = 0;
+  source->sync_method = SYNC_METHOD_UNKNOWN;
+  source->first_ntp_time = 0;
+  source->first_local_time = 0;
+  multicam_status_set_connection(source, false, NULL, false, 0, 0);
   receiver_log(LOG_INFO, source, "Connection closed and resources freed");
 }
 
@@ -1374,6 +1442,9 @@ static bool try_connect(sei_receiver_source_t *source) {
   }
 
   source->is_connected = true;
+  multicam_status_set_connection(source, true, codec_name,
+                                 source->audio_stream_index >= 0,
+                                 source->width, source->height);
   receiver_log(LOG_INFO, source, "Connected successfully!");
   return true;
 }
@@ -1418,6 +1489,9 @@ static void *srt_receive_thread(void *data) {
         cleanup_connection(source);
         continue; /* back to the top of the loop, triggering a reconnect */
       }
+
+      multicam_status_add_packet(source, (size_t)packet->size,
+                                 os_gettime_ns());
 
       /* 3. Handle the packet */
       static uint64_t video_packet_count = 0;
@@ -1519,3 +1593,4 @@ struct obs_source_info sei_receiver_source_info = {
     .get_width = receiver_source_get_width,
     .get_height = receiver_source_get_height,
 };
+

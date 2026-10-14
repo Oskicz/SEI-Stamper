@@ -699,6 +699,16 @@ int main(void) {
   printf("======================\n\n");
 
   printf("[NTP epoch conversion]\n");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000000LL, 0),
+            1000000000LL, "zero audio calibration preserves existing timestamp");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000000LL, 5000000LL),
+            1005000000LL, "positive calibration delays audio");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000LL, -2000000LL), 0,
+            "negative calibration saturates below zero");
+  ASSERT_EQ(receiver_ntp_max_age_seconds(10000), 120,
+            "short NTP interval keeps the minimum freshness window");
+  ASSERT_EQ(receiver_ntp_max_age_seconds(3600000), 3600,
+            "long NTP interval scales freshness up to one hour");
   ASSERT_EQ(receiver_pts_to_ns(48000, 1, 48000), 1000000000LL,
             "audio PTS at 48 kHz converts to one second in ns");
   ASSERT_EQ(receiver_pts_to_ns(90000, 1, 90000), 1000000000LL,
@@ -745,3 +755,4 @@ int main(void) {
 
   return tests_failed;
 }
+

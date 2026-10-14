@@ -149,7 +149,8 @@ static int ntp_last_sockerr(void) {
 
 /* One NTP round-trip against a single address; failures log at debug so the
  * caller can fall through to the next without noise. */
-static bool ntp_sync_one_addr(ntp_client_t *client, struct addrinfo *ai) {
+static bool ntp_sync_one_addr(ntp_client_t *client, struct addrinfo *ai,
+                              uint32_t config_generation) {
   const char *fam = ai->ai_family == AF_INET    ? "IPv4"
                     : ai->ai_family == AF_INET6 ? "IPv6"
                                                 : "other";
@@ -259,12 +260,17 @@ static bool ntp_sync_one_addr(ntp_client_t *client, struct addrinfo *ai) {
   ns_to_ntp((uint64_t)((int64_t)t4_wall + offset), &anchor);
 
   pthread_mutex_lock(&client->state_lock);
-  client->time_offset_ns = offset;
-  client->last_sync_local_time = t4_mono;
-  client->last_sync_time = anchor;
-  client->is_synced = true;
-  client->sync_count++;
+  bool current_config = client->config_generation == config_generation;
+  if (current_config) {
+    client->time_offset_ns = offset;
+    client->last_sync_local_time = t4_mono;
+    client->last_sync_time = anchor;
+    client->is_synced = true;
+    client->sync_count++;
+  }
   pthread_mutex_unlock(&client->state_lock);
+
+  if (!current_config) goto done;
 
   ntp_log(LOG_INFO,
           "NTP sync successful (offset: %lld ms, delay: %lld ms, count: %u)",
@@ -288,6 +294,16 @@ bool ntp_client_sync(ntp_client_t *client) {
     return false;
   }
 
+  char server_address[sizeof(client->server_address)];
+  uint16_t server_port;
+  uint32_t config_generation;
+  pthread_mutex_lock(&client->state_lock);
+  memcpy(server_address, client->server_address, sizeof(server_address));
+  server_address[sizeof(server_address) - 1] = '\0';
+  server_port = client->server_port;
+  config_generation = client->config_generation;
+  pthread_mutex_unlock(&client->state_lock);
+
   struct addrinfo hints;
   struct addrinfo *server_info = NULL;
   memset(&hints, 0, sizeof(hints));
@@ -295,11 +311,11 @@ bool ntp_client_sync(ntp_client_t *client) {
   hints.ai_socktype = SOCK_DGRAM;
 
   char port_str[16];
-  snprintf(port_str, sizeof(port_str), "%d", client->server_port);
+  snprintf(port_str, sizeof(port_str), "%d", server_port);
 
-  int ret = getaddrinfo(client->server_address, port_str, &hints, &server_info);
+  int ret = getaddrinfo(server_address, port_str, &hints, &server_info);
   if (ret != 0) {
-    ntp_log(LOG_ERROR, "getaddrinfo failed for %s: %d", client->server_address,
+    ntp_log(LOG_ERROR, "getaddrinfo failed for %s: %d", server_address,
             ret);
     client->error_count++;
     return false;
@@ -310,7 +326,7 @@ bool ntp_client_sync(ntp_client_t *client) {
   for (struct addrinfo *ai = server_info; ai != NULL && !success;
        ai = ai->ai_next) {
     tried++;
-    success = ntp_sync_one_addr(client, ai);
+    success = ntp_sync_one_addr(client, ai, config_generation);
   }
   freeaddrinfo(server_info);
 
@@ -326,10 +342,31 @@ bool ntp_client_sync(ntp_client_t *client) {
 /* Background sync loop: re-sync on an interval, waking early to stop. */
 static void *ntp_sync_thread(void *arg) {
   ntp_client_t *client = (ntp_client_t *)arg;
+  uint32_t failures = 0;
   while (true) {
-    ntp_client_sync(client);
-    if (os_event_timedwait(client->sync_stop, client->sync_interval_ms) == 0) {
-      break; /* signaled to stop */
+    pthread_mutex_lock(&client->state_lock);
+    bool enabled = client->sync_enabled;
+    bool shutting_down = client->shutdown_requested;
+    uint32_t interval = client->sync_interval_ms;
+    pthread_mutex_unlock(&client->state_lock);
+    if (shutting_down) break;
+
+    bool synced = enabled ? ntp_client_sync(client) : false;
+    uint32_t wait_ms = interval;
+    if (synced || !enabled) {
+      failures = 0;
+    } else {
+      if (failures < 6) failures++;
+      uint64_t backoff = 1000ULL << (failures - 1);
+      if (backoff > 60000) backoff = 60000;
+      if (backoff < wait_ms) wait_ms = (uint32_t)backoff;
+    }
+    if (os_event_timedwait(client->sync_stop, wait_ms) == 0) {
+      os_event_reset(client->sync_stop);
+      pthread_mutex_lock(&client->state_lock);
+      shutting_down = client->shutdown_requested;
+      pthread_mutex_unlock(&client->state_lock);
+      if (shutting_down) break;
     }
   }
   return NULL;
@@ -340,7 +377,13 @@ void ntp_client_start_background_sync(ntp_client_t *client,
   if (!client || !client->is_initialized || client->sync_thread_active) {
     return;
   }
-  client->sync_interval_ms = interval_ms ? interval_ms : 60000;
+  uint32_t interval = interval_ms ? interval_ms : 60000;
+  if (interval < 1000) interval = 1000;
+  pthread_mutex_lock(&client->state_lock);
+  client->sync_interval_ms = interval;
+  client->sync_enabled = true;
+  client->shutdown_requested = false;
+  pthread_mutex_unlock(&client->state_lock);
   if (os_event_init(&client->sync_stop, OS_EVENT_TYPE_MANUAL) != 0) {
     ntp_log(LOG_ERROR, "Failed to create NTP sync stop event");
     return;
@@ -353,7 +396,35 @@ void ntp_client_start_background_sync(ntp_client_t *client,
   }
   client->sync_thread_active = true;
   ntp_log(LOG_INFO, "NTP background sync started (interval %u ms)",
-          client->sync_interval_ms);
+          interval);
+}
+
+void ntp_client_update_settings(ntp_client_t *client, const char *server,
+                                uint16_t port, uint32_t interval_ms,
+                                bool enabled)
+{
+  if (!client || !client->is_initialized) return;
+  const char *resolved_server = server && server[0] ? server : "time.windows.com";
+  if (!port) port = 123;
+  if (!interval_ms) interval_ms = 10000;
+  if (interval_ms < 1000) interval_ms = 1000;
+  pthread_mutex_lock(&client->state_lock);
+  bool endpoint_changed = strcmp(client->server_address, resolved_server) != 0 ||
+                          client->server_port != port;
+  snprintf(client->server_address, sizeof(client->server_address), "%s",
+           resolved_server);
+  client->server_port = port;
+  client->sync_interval_ms = interval_ms;
+  client->sync_enabled = enabled;
+  if (endpoint_changed) {
+    client->config_generation++;
+    client->is_synced = false;
+    client->last_sync_local_time = 0;
+    memset(&client->last_sync_time, 0, sizeof(client->last_sync_time));
+  }
+  pthread_mutex_unlock(&client->state_lock);
+  if (client->sync_thread_active && client->sync_stop)
+    os_event_signal(client->sync_stop);
 }
 
 /* Get the current NTP timestamp */
@@ -397,20 +468,27 @@ bool ntp_client_get_time(ntp_client_t *client, ntp_timestamp_t *timestamp) {
 
 /* Get the time offset */
 int64_t ntp_client_get_offset(ntp_client_t *client) {
-  if (!client) {
+  if (!client || !client->is_initialized) {
     return 0;
   }
-  return client->time_offset_ns;
+  pthread_mutex_lock(&client->state_lock);
+  int64_t offset = client->time_offset_ns;
+  pthread_mutex_unlock(&client->state_lock);
+  return offset;
 }
 
 /* Check whether a re-sync is needed */
 bool ntp_client_needs_resync(ntp_client_t *client, uint32_t max_age_seconds) {
-  if (!client || !client->is_synced) {
+  if (!client || !client->is_initialized) {
     return true;
   }
-
+  pthread_mutex_lock(&client->state_lock);
+  bool synced = client->is_synced;
+  uint64_t last_sync = client->last_sync_local_time;
+  pthread_mutex_unlock(&client->state_lock);
+  if (!synced) return true;
   uint64_t current = get_current_time_ns();
-  uint64_t age_ns = current - client->last_sync_local_time;
+  uint64_t age_ns = current >= last_sync ? current - last_sync : UINT64_MAX;
   uint64_t max_age_ns = (uint64_t)max_age_seconds * 1000000000ULL;
 
   return age_ns > max_age_ns;
@@ -423,6 +501,9 @@ void ntp_client_destroy(ntp_client_t *client) {
   }
 
   if (client->sync_thread_active) {
+    pthread_mutex_lock(&client->state_lock);
+    client->shutdown_requested = true;
+    pthread_mutex_unlock(&client->state_lock);
     os_event_signal(client->sync_stop);
     pthread_join(client->sync_thread, NULL);
     os_event_destroy(client->sync_stop);
@@ -438,3 +519,4 @@ void ntp_client_destroy(ntp_client_t *client) {
 
   memset(client, 0, sizeof(ntp_client_t));
 }
+

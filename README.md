@@ -187,6 +187,18 @@ See the [LICENSE](LICENSE) file for details.
 
 Sources: [NTP client](src/ntp-client.c), [NVENC](src/nvenc-encoder.c), [AMF](src/amd-encoder.c), [QSV](src/qsv-encoder.c), [receiver](src/sei-receiver-source.c), [CMake](CMakeLists.txt), [tests](tests/test_ntp_sei.c).
 
+### Multicam Sync Center (OBS 32.2.2)
+
+The receiver registers itself in the **Multicam Sync Center** dock. The dock reports live connection/video/audio flow, decoded codec and FPS, NTP freshness, the timestamp mode actually used, automatic video PTS offset, manual audio offset, and the spread between recent absolute camera timestamps. RX rate is measured from FFmpeg `av_read_frame()` packet payload bytes, as a one-second sample and five-sample average; it excludes SRT, MPEG-TS, and IP transport overhead. A PTS fallback is shown explicitly and cannot pass preflight.
+
+Preflight requires at least two receiver sources, recent packets/video, recent audio when an audio stream exists, a measured non-zero receive bitrate, a fresh NTP anchor, absolute timestamp metadata, and a timestamp spread no greater than 16.67 ms (one 60 FPS frame). This checks that audio is flowing; it does **not** verify acoustic or lip-sync correctness. Verify audio with a playback test before an event.
+
+The receiver supports the existing SEI-Stamper UUID timestamp and Moblin's HEVC `time_code` SEI (payload type 136). Moblin timecode has no date; the receiver resolves its time of day to the nearest UTC date using a fresh NTP clock. It falls back to PTS if the NTP anchor, frame rate, or timecode is unavailable or ambiguous. Set the sender's Moblin timecode option on and use NTP on the receiver.
+
+The receiver property **Audio offset relative to video (ms)** applies a manual calibration from -500 to +500 ms. Zero preserves the default audio timestamps. Positive values delay audio. Use it only after measuring the actual audio path.
+
+The redacted diagnostics export intentionally omits source names, SRT URLs, stream IDs, hostnames, and credentials.
+
 The entries below are retained historical release notes, not current compatibility or validation claims.
 
 ### v1.2.3-beta (2026-06-07)
@@ -254,3 +266,4 @@ The entries below are retained historical release notes, not current compatibili
 
 **Current Version**: 1.3.0
 **Last Updated**: 2026-09-05
+

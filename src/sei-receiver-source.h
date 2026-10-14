@@ -28,6 +28,13 @@ typedef enum {
   SYNC_STATE_SYNCHRONIZED /* synchronised */
 } sync_state_t;
 
+typedef enum {
+  SYNC_METHOD_UNKNOWN,
+  SYNC_METHOD_PTS_FALLBACK,
+  SYNC_METHOD_SEI_STAMPER_NTP,
+  SYNC_METHOD_MOBLIN_TIMECODE
+} sync_method_t;
+
 /* Video frame data */
 typedef struct video_frame_data {
   uint8_t *data;            /* frame data */
@@ -97,6 +104,7 @@ typedef struct sei_receiver_source {
   /* PTS sync */
   int64_t pts_offset;  /* PTS to SystemTime offset */
   bool has_pts_offset; /* whether the offset has been computed */
+  sync_method_t sync_method; /* actual timestamp source in use */
 
   /* Audio decode */
   void *audio_codec_context;      /* FFmpeg audio codec context */
@@ -104,7 +112,10 @@ typedef struct sei_receiver_source {
   enum audio_format audio_format; /* OBS audio format */
   uint32_t audio_channels;        /* channel count */
   uint32_t audio_sample_rate;     /* sample rate */
+  int64_t audio_offset_ns;        /* manual audio-to-video calibration */
   void *audio_resampler;          /* SwrContext*: decoder -> OBS audio format */
+  pthread_mutex_t audio_settings_lock;
+  bool audio_settings_lock_initialized;
   int audio_resampler_sample_fmt;
   int audio_resampler_sample_rate;
   AVChannelLayout audio_resampler_layout;
@@ -113,6 +124,12 @@ typedef struct sei_receiver_source {
   uint64_t frames_received;       /* total frames received */
   uint64_t frames_rendered;       /* total frames rendered */
   uint64_t frames_dropped;        /* frames dropped */
+  uint64_t decode_errors_total;   /* cumulative video decoder errors */
+  uint64_t audio_frames_received; /* decoded audio frames output to OBS */
+  uint64_t rx_bytes_total;        /* demuxed packet bytes, cumulative */
+  uint64_t rx_bytes_window;       /* packet bytes since last bitrate sample */
+  uint64_t rx_bitrate_sample_ns;  /* monotonic sample time */
+  uint64_t rx_bitrate_bps;        /* measured receive bitrate */
   uint64_t sei_found_count;       /* frames where an SEI was found */
   uint64_t last_sync_frame_count; /* frame count at the last sync */
 
@@ -178,3 +195,4 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
 #ifdef __cplusplus
 }
 #endif
+

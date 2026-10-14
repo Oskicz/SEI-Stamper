@@ -51,3 +51,28 @@ static inline bool receiver_ntp_to_monotonic_ns(uint32_t frame_seconds,
   *display_ns = monotonic_anchor_ns + delta;
   return true;
 }
+
+/* Apply a user calibration to an already mapped OBS monotonic timestamp.
+ * Positive offset delays audio; negative offset advances it. */
+static inline uint64_t receiver_audio_timestamp_with_offset(int64_t timestamp_ns,
+                                                            int64_t offset_ns)
+{
+  if (timestamp_ns < 0) return 0;
+  if (offset_ns > 0 && timestamp_ns > INT64_MAX - offset_ns)
+    return (uint64_t)INT64_MAX;
+  if (offset_ns < 0 &&
+      (offset_ns == INT64_MIN || timestamp_ns < -offset_ns))
+    return 0;
+  int64_t adjusted = timestamp_ns + offset_ns;
+  return adjusted > 0 ? (uint64_t)adjusted : 0;
+}
+
+static inline uint32_t receiver_ntp_max_age_seconds(uint32_t sync_interval_ms)
+{
+  uint64_t interval_seconds = ((uint64_t)sync_interval_ms + 999ULL) / 1000ULL;
+  uint64_t max_age = interval_seconds * 3ULL;
+  if (max_age < 120ULL) max_age = 120ULL;
+  if (max_age > 3600ULL) max_age = 3600ULL;
+  return (uint32_t)max_age;
+}
+
