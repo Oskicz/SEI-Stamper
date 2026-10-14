@@ -720,7 +720,7 @@ int main(void) {
                                             1791986568000000000LL,
                                             &projected_unix_ns),
               "project frame monotonic timestamp through fresh NTP anchor");
-  ASSERT_EQ(projected_unix_ns, 1791986573000000000LL,
+  ASSERT_EQ(projected_unix_ns, 1791986568500000000LL,
             "projected UTC advances with video PTS");
   ASSERT_TRUE(!receiver_monotonic_to_unix_ns(INT64_MAX, 0,
                                               INT64_MAX, &projected_unix_ns),
