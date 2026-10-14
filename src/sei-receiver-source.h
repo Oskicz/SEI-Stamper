@@ -42,6 +42,7 @@ typedef struct video_frame_data {
   int64_t pts;              /* presentation timestamp in nanoseconds */
   ntp_timestamp_t ntp_time; /* NTP timestamp, extracted from the SEI */
   bool has_ntp;             /* whether an NTP timestamp is present */
+  sync_method_t timestamp_source; /* origin of this frame's absolute timestamp */
   uint32_t width;           /* video width */
   uint32_t height;          /* video height */
   enum video_format format; /* video format */
@@ -105,6 +106,7 @@ typedef struct sei_receiver_source {
   int64_t pts_offset;  /* PTS to SystemTime offset */
   bool has_pts_offset; /* whether the offset has been computed */
   sync_method_t sync_method; /* actual timestamp source in use */
+  sync_method_t absolute_sync_method; /* last validated absolute timestamp source */
 
   /* Audio decode */
   void *audio_codec_context;      /* FFmpeg audio codec context */
