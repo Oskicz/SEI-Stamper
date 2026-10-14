@@ -626,7 +626,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   uint32_t target_rcvlatency_ms = receiver_sync_latency_target_ms(
       source->srt_rcvlatency_ms, observed_latency_ns, max_input_age_ns);
   if (target_rcvlatency_ms > source->srt_rcvlatency_ms &&
-      source->latency_adjustment_attempts < 2 &&
+      source->latency_adjustment_attempts < 1 &&
       (!source->last_latency_adjustment_ns ||
        status_now_ns - source->last_latency_adjustment_ns > 60000000000ULL)) {
     source->srt_rcvlatency_ms = target_rcvlatency_ms;
@@ -1558,6 +1558,14 @@ static void *srt_receive_thread(void *data) {
     if (source->is_connected && source->format_context) {
       int ret =
           av_read_frame((AVFormatContext *)source->format_context, packet);
+
+      if (ret == AVERROR(EAGAIN) || ret == AVERROR(EINTR)) {
+        /* Temporary read starvation is not a broken SRT connection. Keep the
+         * demuxer and decoder state alive so the next packet can resume. */
+        av_packet_unref(packet);
+        os_sleep_ms(2);
+        continue;
+      }
 
       if (ret < 0) {
         /* Read error or EOF -> drop the connection and reconnect */
