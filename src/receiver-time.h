@@ -3,6 +3,30 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+static inline bool receiver_keep_absolute_sync(bool has_absolute_anchor,
+                                               bool ntp_enabled,
+                                               bool ntp_fresh)
+{
+  return has_absolute_anchor && ntp_enabled && ntp_fresh;
+}
+
+static inline bool receiver_monotonic_to_unix_ns(int64_t frame_mono_ns,
+                                                  int64_t anchor_mono_ns,
+                                                  int64_t anchor_unix_ns,
+                                                  int64_t *unix_ns)
+{
+  if (!unix_ns ||
+      (anchor_mono_ns < 0 && frame_mono_ns > INT64_MAX + anchor_mono_ns) ||
+      (anchor_mono_ns > 0 && frame_mono_ns < INT64_MIN + anchor_mono_ns))
+    return false;
+  int64_t delta = frame_mono_ns - anchor_mono_ns;
+  if ((delta > 0 && anchor_unix_ns > INT64_MAX - delta) ||
+      (delta < 0 && anchor_unix_ns < INT64_MIN - delta))
+    return false;
+  *unix_ns = anchor_unix_ns + delta;
+  return true;
+}
+
 /* Convert a stream PTS to the receiver's monotonic nanosecond time scale. */
 static inline int64_t receiver_pts_to_ns(int64_t pts, int time_base_num,
                                          int time_base_den)
