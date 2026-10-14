@@ -572,6 +572,9 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   obs_frame.timestamp = calculate_display_time(source, frame_out);
 
   int64_t absolute_unix_ns = 0;
+  int64_t current_unix_ns = 0;
+  uint64_t observed_latency_ns = 0;
+  uint64_t status_now_ns = os_gettime_ns();
   bool ntp_fresh = false;
   multicam_status_sync_method_t status_method = MULTICAM_SYNC_PTS_FALLBACK;
   if (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP)
@@ -584,31 +587,57 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
         &source->ntp_client,
         receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
     if (ntp_fresh) {
+      ntp_timestamp_t current_ntp;
+      bool have_current_time =
+          ntp_client_get_time(&source->ntp_client, &current_ntp) &&
+          receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
+                                  &current_unix_ns);
       if (frame_out->has_ntp &&
           receiver_ntp_to_unix_ns(frame_out->ntp_time.seconds,
                                   frame_out->ntp_time.fraction,
                                   &absolute_unix_ns)) {
         /* Current frame has an absolute timestamp. */
       } else {
-        ntp_timestamp_t current_ntp;
-        int64_t anchor_unix_ns;
-        if (ntp_client_get_time(&source->ntp_client, &current_ntp) &&
-            receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
-                                    &anchor_unix_ns) &&
+        if (have_current_time &&
             receiver_monotonic_to_unix_ns((int64_t)obs_frame.timestamp,
-                                          (int64_t)os_gettime_ns(),
-                                          anchor_unix_ns,
+                                          (int64_t)status_now_ns,
+                                          current_unix_ns,
                                           &absolute_unix_ns)) {
           /* Project this PTS-only frame through the fresh NTP anchor. */
         } else {
           ntp_fresh = false;
         }
       }
+      if (ntp_fresh && have_current_time && absolute_unix_ns > 0 &&
+          current_unix_ns > absolute_unix_ns)
+        observed_latency_ns =
+            (uint64_t)(current_unix_ns - absolute_unix_ns);
     }
   }
   multicam_status_video(source, status_method, ntp_fresh, absolute_unix_ns,
-                        frame_out->width, frame_out->height, source->pts_offset,
-                        os_gettime_ns());
+                        observed_latency_ns, frame_out->width, frame_out->height,
+                        source->pts_offset, status_now_ns);
+
+  /* Ask SRT to hold lower-latency feeds until they match the oldest recent
+   * absolute timestamp. This delays compressed A/V together in the transport
+   * receiver buffer and avoids a large decoded-frame queue. */
+  uint64_t max_input_age_ns =
+      multicam_status_max_observed_latency_ns(status_now_ns);
+  uint32_t target_rcvlatency_ms = receiver_sync_latency_target_ms(
+      source->srt_rcvlatency_ms, observed_latency_ns, max_input_age_ns);
+  if (target_rcvlatency_ms > source->srt_rcvlatency_ms &&
+      source->latency_adjustment_attempts < 2 &&
+      (!source->last_latency_adjustment_ns ||
+       status_now_ns - source->last_latency_adjustment_ns > 60000000000ULL)) {
+    source->srt_rcvlatency_ms = target_rcvlatency_ms;
+    source->latency_adjustment_attempts++;
+    source->last_latency_adjustment_ns = status_now_ns;
+    source->latency_reconnect_pending = true;
+    multicam_status_set_srt_latency(source, target_rcvlatency_ms);
+    receiver_log(LOG_INFO, source,
+                 "Adaptive SRT sync: requesting %u ms receive latency to match slower timestamped inputs",
+                 target_rcvlatency_ms);
+  }
 
   /* Debug log: confirm the timestamp */
   receiver_log(
@@ -937,6 +966,8 @@ static void *receiver_source_create(obs_data_t *settings,
   }
   ctx->audio_settings_lock_initialized = true;
   multicam_status_register(ctx, obs_source_get_name(source));
+  ctx->srt_rcvlatency_ms = 120; /* SRT default receiver buffer */
+  multicam_status_set_srt_latency(ctx, ctx->srt_rcvlatency_ms);
 
   /* Initialise the sync state */
   ctx->sync_state = SYNC_STATE_WAITING;
@@ -1315,6 +1346,13 @@ static bool try_connect(sei_receiver_source_t *source) {
   /* Set a timeout so it cannot block for long */
   AVDictionary *options = NULL;
   av_dict_set(&options, "timeout", "2000000", 0); /* 2 s timeout */
+  if (source->srt_rcvlatency_ms > 120) {
+    av_dict_set_int(&options, "rcvlatency",
+                    (int64_t)source->srt_rcvlatency_ms * 1000, 0);
+    receiver_log(LOG_INFO, source,
+                 "Opening SRT input with requested receive latency %u ms",
+                 source->srt_rcvlatency_ms);
+  }
 
   /* Use the configured SRT URL as-is (it may carry ?streamid=xxx etc.) */
   if (avformat_open_input(&fmt_ctx, source->srt_url, NULL, &options) < 0) {
@@ -1325,6 +1363,9 @@ static bool try_connect(sei_receiver_source_t *source) {
       av_dict_free(&options);
     return false;
   }
+  if (av_dict_get(options, "rcvlatency", NULL, 0))
+    receiver_log(LOG_WARNING, source,
+                 "FFmpeg did not consume the SRT rcvlatency option; adaptive latency may be unsupported for this URL");
   if (options)
     av_dict_free(&options);
 
@@ -1543,6 +1584,11 @@ static void *srt_receive_thread(void *data) {
         video_frame_data_t frame = {0};
         if (decode_and_extract_sei(source, packet, &frame)) {
           source->frames_rendered++;
+        }
+        if (source->latency_reconnect_pending) {
+          source->latency_reconnect_pending = false;
+          cleanup_connection(source);
+          continue;
         }
       } else if (source->audio_stream_index >= 0 &&
                  packet->stream_index == source->audio_stream_index) {
