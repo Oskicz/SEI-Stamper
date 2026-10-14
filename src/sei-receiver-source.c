@@ -483,6 +483,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
 
   /* Try to pull the SEI out of the side data */
   frame_out->has_ntp = false;
+  frame_out->timestamp_source = SYNC_METHOD_UNKNOWN;
 
   AVFrameSideData *sei_data =
       av_frame_get_side_data(av_frame, AV_FRAME_DATA_SEI_UNREGISTERED);
@@ -493,6 +494,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     if (parse_ntp_sei(sei_data->data, sei_data->size, &ntp_data)) {
       frame_out->ntp_time = ntp_data.ntp_time;
       frame_out->has_ntp = true;
+      frame_out->timestamp_source = SYNC_METHOD_SEI_STAMPER_NTP;
       source->sei_found_count++;
 
       receiver_log(LOG_DEBUG, source,
@@ -511,15 +513,13 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
       if (parse_ntp_sei(payload, payload_size, &ntp_data)) {
         frame_out->ntp_time = ntp_data.ntp_time;
         frame_out->has_ntp = true;
+        frame_out->timestamp_source = SYNC_METHOD_SEI_STAMPER_NTP;
         source->sei_found_count++;
       }
     }
   }
 
-  if (frame_out->has_ntp && source->ntp_enabled) {
-    source->sync_method = SYNC_METHOD_SEI_STAMPER_NTP;
-  } else {
-    source->sync_method = SYNC_METHOD_PTS_FALLBACK;
+  if (!frame_out->has_ntp && source->ntp_enabled) {
     AVFormatContext *format_ctx = (AVFormatContext *)source->format_context;
     moblin_timecode_t moblin_tc;
     if (!frame_out->has_ntp && source->ntp_enabled && format_ctx &&
@@ -549,6 +549,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
         frame_out->ntp_time.fraction =
             (uint32_t)((fraction_ns << 32) / 1000000000ULL);
         frame_out->has_ntp = true;
+        frame_out->timestamp_source = SYNC_METHOD_MOBLIN_TIMECODE;
         source->sync_method = SYNC_METHOD_MOBLIN_TIMECODE;
         source->sei_found_count++;
       }
@@ -566,6 +567,8 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   obs_frame.format = VIDEO_FORMAT_BGRA;
 
   /* Calculate correct Sync Timestamp */
+  if (frame_out->has_ntp)
+    source->sync_method = frame_out->timestamp_source;
   obs_frame.timestamp = calculate_display_time(source, frame_out);
 
   int64_t absolute_unix_ns = 0;
@@ -580,10 +583,28 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     ntp_fresh = !ntp_client_needs_resync(
         &source->ntp_client,
         receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
-    if (ntp_fresh)
-      receiver_ntp_to_unix_ns(frame_out->ntp_time.seconds,
-                              frame_out->ntp_time.fraction,
-                              &absolute_unix_ns);
+    if (ntp_fresh) {
+      if (frame_out->has_ntp &&
+          receiver_ntp_to_unix_ns(frame_out->ntp_time.seconds,
+                                  frame_out->ntp_time.fraction,
+                                  &absolute_unix_ns)) {
+        /* Current frame has an absolute timestamp. */
+      } else {
+        ntp_timestamp_t current_ntp;
+        int64_t anchor_unix_ns;
+        if (ntp_client_get_time(&source->ntp_client, &current_ntp) &&
+            receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
+                                    &anchor_unix_ns) &&
+            receiver_monotonic_to_unix_ns((int64_t)obs_frame.timestamp,
+                                          (int64_t)os_gettime_ns(),
+                                          anchor_unix_ns,
+                                          &absolute_unix_ns)) {
+          /* Project this PTS-only frame through the fresh NTP anchor. */
+        } else {
+          ntp_fresh = false;
+        }
+      }
+    }
   }
   multicam_status_video(source, status_method, ntp_fresh, absolute_unix_ns,
                         frame_out->width, frame_out->height, source->pts_offset,
@@ -690,12 +711,25 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
     // if (source->sei_found_count % 1 == 0) // Always
     source->pts_offset = display_time - frame->pts;
     source->has_pts_offset = true;
+    source->absolute_sync_method = frame->timestamp_source;
+    if (source->absolute_sync_method != SYNC_METHOD_MOBLIN_TIMECODE)
+      source->absolute_sync_method = SYNC_METHOD_SEI_STAMPER_NTP;
+    source->sync_method = source->absolute_sync_method;
 
     return display_time;
   }
 
-  /* No NTP, or disabled: fall back to plain PTS sync */
+  bool ntp_fresh = source->ntp_enabled &&
+      !ntp_client_needs_resync(&source->ntp_client,
+          receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
+  if (receiver_keep_absolute_sync(
+          source->absolute_sync_method != SYNC_METHOD_UNKNOWN,
+          source->ntp_enabled, ntp_fresh) && source->has_pts_offset) {
+    source->sync_method = source->absolute_sync_method;
+    return get_sync_timestamp(source, frame->pts);
+  }
   source->sync_method = SYNC_METHOD_PTS_FALLBACK;
+  source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
   return get_sync_timestamp(source, frame->pts);
 }
 
@@ -1169,6 +1203,7 @@ static void receiver_source_update(void *data, obs_data_t *settings) {
     ctx->ntp_sync_interval_ms = ntp_interval;
     ctx->has_pts_offset = false;
     ctx->sync_method = SYNC_METHOD_UNKNOWN;
+    ctx->absolute_sync_method = SYNC_METHOD_UNKNOWN;
     if (ctx->ntp_client.is_initialized) {
       ntp_client_update_settings(&ctx->ntp_client, ctx->ntp_server,
                                  ctx->ntp_port, ntp_interval, ntp_enabled);
@@ -1261,6 +1296,7 @@ static void cleanup_connection(sei_receiver_source_t *source) {
   source->has_pts_offset = false;
   source->pts_offset = 0;
   source->sync_method = SYNC_METHOD_UNKNOWN;
+  source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
   source->first_ntp_time = 0;
   source->first_local_time = 0;
   multicam_status_set_connection(source, false, NULL, false, 0, 0);
