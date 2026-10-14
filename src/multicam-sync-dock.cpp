@@ -172,6 +172,8 @@ void exportReport()
     item.insert(QStringLiteral("demuxed_rx_payload_bps_1s"), static_cast<qint64>(s.rx_bitrate_bps));
     item.insert(QStringLiteral("demuxed_rx_payload_bps_5s_average"), static_cast<qint64>(s.rx_bitrate_5s_bps));
     item.insert(QStringLiteral("video_pts_offset_ns"), static_cast<qint64>(s.video_offset_ns));
+    item.insert(QStringLiteral("observed_input_latency_ms"), s.observed_latency_ns / 1000000.0);
+    item.insert(QStringLiteral("srt_receive_latency_ms"), s.srt_rcvlatency_ms);
     item.insert(QStringLiteral("fps"), s.fps_milli / 1000.0);
     item.insert(QStringLiteral("ready"), ready);
     item.insert(QStringLiteral("decode_errors_total"), static_cast<qint64>(s.decode_errors));
