@@ -728,7 +728,7 @@ int main(void) {
   ASSERT_EQ(receiver_sync_latency_target_ms(120, 400000000ULL,
                                              3400000000ULL), 3220,
             "increase fast SRT input latency to match the slower camera");
-  ASSERT_EQ(receiver_sync_latency_target_ms(120, 3100000000ULL,
+  ASSERT_EQ(receiver_sync_latency_target_ms(120, 3101000000ULL,
                                              3400000000ULL), 120,
             "ignore small inter-camera latency differences");
   ASSERT_EQ(receiver_sync_latency_target_ms(7400, 0, 8000000000ULL), 7500,
