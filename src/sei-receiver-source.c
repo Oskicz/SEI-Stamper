@@ -530,7 +530,8 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
       ntp_timestamp_t current_ntp;
       int64_t current_unix_ns, mapped_unix_ns;
       AVStream *stream = format_ctx->streams[source->video_stream_index];
-      AVRational fps = av_guess_frame_rate(format_ctx, stream, av_frame);
+      AVRational fps = moblin_select_timecode_rate(stream->r_frame_rate,
+                                                   stream->avg_frame_rate);
       /* A fresh local NTP anchor supplies the missing calendar date. With no
        * trustworthy anchor or frame rate, retain the explicit PTS fallback. */
       uint32_t ntp_max_age =
@@ -617,27 +618,6 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   multicam_status_video(source, status_method, ntp_fresh, absolute_unix_ns,
                         observed_latency_ns, frame_out->width, frame_out->height,
                         source->pts_offset, status_now_ns);
-
-  /* Ask SRT to hold lower-latency feeds until they match the oldest recent
-   * absolute timestamp. This delays compressed A/V together in the transport
-   * receiver buffer and avoids a large decoded-frame queue. */
-  uint64_t max_input_age_ns =
-      multicam_status_max_observed_latency_ns(status_now_ns);
-  uint32_t target_rcvlatency_ms = receiver_sync_latency_target_ms(
-      source->srt_rcvlatency_ms, observed_latency_ns, max_input_age_ns);
-  if (target_rcvlatency_ms > source->srt_rcvlatency_ms &&
-      source->latency_adjustment_attempts < 1 &&
-      (!source->last_latency_adjustment_ns ||
-       status_now_ns - source->last_latency_adjustment_ns > 60000000000ULL)) {
-    source->srt_rcvlatency_ms = target_rcvlatency_ms;
-    source->latency_adjustment_attempts++;
-    source->last_latency_adjustment_ns = status_now_ns;
-    source->latency_reconnect_pending = true;
-    multicam_status_set_srt_latency(source, target_rcvlatency_ms);
-    receiver_log(LOG_INFO, source,
-                 "Adaptive SRT sync: requesting %u ms receive latency to match slower timestamped inputs",
-                 target_rcvlatency_ms);
-  }
 
   /* Debug log: confirm the timestamp */
   receiver_log(
@@ -1595,11 +1575,6 @@ static void *srt_receive_thread(void *data) {
         video_frame_data_t frame = {0};
         if (decode_and_extract_sei(source, packet, &frame)) {
           source->frames_rendered++;
-        }
-        if (source->latency_reconnect_pending) {
-          source->latency_reconnect_pending = false;
-          cleanup_connection(source);
-          continue;
         }
       } else if (source->audio_stream_index >= 0 &&
                  packet->stream_index == source->audio_stream_index) {
