@@ -725,6 +725,14 @@ int main(void) {
   ASSERT_TRUE(!receiver_monotonic_to_unix_ns(INT64_MAX, 0,
                                               INT64_MAX, &projected_unix_ns),
               "reject overflowing UTC projection");
+  ASSERT_EQ(receiver_sync_latency_target_ms(120, 400000000ULL,
+                                             3400000000ULL), 3220,
+            "increase fast SRT input latency to match the slower camera");
+  ASSERT_EQ(receiver_sync_latency_target_ms(120, 3101000000ULL,
+                                             3400000000ULL), 120,
+            "ignore small inter-camera latency differences");
+  ASSERT_EQ(receiver_sync_latency_target_ms(7400, 0, 8000000000ULL), 7500,
+            "cap automatic SRT latency below the protocol maximum");
   ASSERT_EQ(receiver_pts_to_ns(48000, 1, 48000), 1000000000LL,
             "audio PTS at 48 kHz converts to one second in ns");
   ASSERT_EQ(receiver_pts_to_ns(90000, 1, 90000), 1000000000LL,
