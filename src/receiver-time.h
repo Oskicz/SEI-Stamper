@@ -27,29 +27,6 @@ static inline bool receiver_monotonic_to_unix_ns(int64_t frame_mono_ns,
   return true;
 }
 
-/* Increase receiver-side SRT playout latency only when another absolute-
- * timestamped camera is materially older. SRT latency options use ms in the
- * UI-facing helper; FFmpeg receives the final value in microseconds. */
-static inline uint32_t receiver_sync_latency_target_ms(uint32_t current_ms,
-                                                        uint64_t own_age_ns,
-                                                        uint64_t max_age_ns)
-{
-  const uint64_t min_difference_ns = 300000000ULL;
-  const uint32_t safety_margin_ms = 100;
-  const uint32_t maximum_ms = 7500;
-  if (current_ms > maximum_ms)
-    current_ms = maximum_ms;
-  if (max_age_ns <= own_age_ns || max_age_ns - own_age_ns < min_difference_ns)
-    return current_ms;
-  uint64_t difference_ns = max_age_ns - own_age_ns;
-  uint64_t extra_ms = difference_ns / 1000000ULL +
-                      (difference_ns % 1000000ULL != 0) + safety_margin_ms;
-  uint64_t target_ms = (uint64_t)current_ms + extra_ms;
-  if (target_ms > maximum_ms)
-    target_ms = maximum_ms;
-  return (uint32_t)target_ms;
-}
-
 /* Convert a stream PTS to the receiver's monotonic nanosecond time scale. */
 static inline int64_t receiver_pts_to_ns(int64_t pts, int time_base_num,
                                          int time_base_den)
