@@ -530,8 +530,12 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
       ntp_timestamp_t current_ntp;
       int64_t current_unix_ns, mapped_unix_ns;
       AVStream *stream = format_ctx->streams[source->video_stream_index];
-      AVRational fps = moblin_select_timecode_rate(stream->r_frame_rate,
-                                                   stream->avg_frame_rate);
+      AVRational fps = {0, 1};
+      moblin_select_timecode_rate(stream->r_frame_rate.num,
+                                  stream->r_frame_rate.den,
+                                  stream->avg_frame_rate.num,
+                                  stream->avg_frame_rate.den, &fps.num,
+                                  &fps.den);
       /* A fresh local NTP anchor supplies the missing calendar date. With no
        * trustworthy anchor or frame rate, retain the explicit PTS fallback. */
       uint32_t ntp_max_age =
