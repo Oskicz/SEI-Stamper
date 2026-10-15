@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "../src/receiver-time.h"
 
 /* ─── OBS shims ────────────────────────────────────────────────────────── */
 
@@ -698,6 +699,49 @@ int main(void) {
   printf("======================\n\n");
 
   printf("[NTP epoch conversion]\n");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000000LL, 0),
+            1000000000LL, "zero audio calibration preserves existing timestamp");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000000LL, 5000000LL),
+            1005000000LL, "positive calibration delays audio");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000LL, -2000000LL), 0,
+            "negative calibration saturates below zero");
+  ASSERT_EQ(receiver_ntp_max_age_seconds(10000), 120,
+            "short NTP interval keeps the minimum freshness window");
+  ASSERT_EQ(receiver_ntp_max_age_seconds(3600000), 3600,
+            "long NTP interval scales freshness up to one hour");
+  ASSERT_TRUE(receiver_keep_absolute_sync(true, true, true),
+              "fresh NTP anchor remains active between metadata frames");
+  ASSERT_TRUE(!receiver_keep_absolute_sync(true, true, false),
+              "stale NTP anchor falls back to PTS");
+  ASSERT_TRUE(!receiver_keep_absolute_sync(true, false, true),
+              "disabled NTP anchor falls back to PTS");
+  int64_t projected_unix_ns = 0;
+  ASSERT_TRUE(receiver_monotonic_to_unix_ns(10500000000LL, 10000000000LL,
+                                            1791986568000000000LL,
+                                            &projected_unix_ns),
+              "project frame monotonic timestamp through fresh NTP anchor");
+  ASSERT_EQ(projected_unix_ns, 1791986568500000000LL,
+            "projected UTC advances with video PTS");
+  ASSERT_TRUE(!receiver_monotonic_to_unix_ns(INT64_MAX, 0,
+                                              INT64_MAX, &projected_unix_ns),
+              "reject overflowing UTC projection");
+  ASSERT_EQ(receiver_pts_to_ns(48000, 1, 48000), 1000000000LL,
+            "audio PTS at 48 kHz converts to one second in ns");
+  ASSERT_EQ(receiver_pts_to_ns(90000, 1, 90000), 1000000000LL,
+            "video PTS at 90 kHz converts to one second in ns");
+  ASSERT_EQ(receiver_pts_to_ns(-24000, 1, 48000), -500000000LL,
+            "negative PTS preserves signed nanoseconds");
+  ASSERT_EQ(receiver_pts_to_ns(1, 0, 48000), 0,
+            "invalid time base is rejected");
+  int64_t display_ns = 0;
+  ASSERT_TRUE(receiver_ntp_to_monotonic_ns(3927441601U, 0, 3927441600U, 0,
+                                            5000000000LL, &display_ns),
+              "NTP timestamp maps through monotonic anchor");
+  ASSERT_EQ(display_ns, 6000000000LL,
+            "NTP frame one second ahead maps one second ahead monotonically");
+  ASSERT_TRUE(!receiver_ntp_to_monotonic_ns(0, 0, 3927441600U, 0,
+                                             5000000000LL, &display_ns),
+              "invalid NTP epoch is rejected");
   test_ntp_epoch_conversion_roundtrip();
   test_ntp_fractional_precision();
   test_ntp_conversion_known_values();
@@ -727,3 +771,4 @@ int main(void) {
 
   return tests_failed;
 }
+

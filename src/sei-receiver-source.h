@@ -10,6 +10,7 @@
 #include "ntp-client.h"
 #include "sei-handler.h"
 #include <libavcodec/avcodec.h> /* AVPacket */
+#include <libavutil/channel_layout.h>
 #include <obs-module.h>
 #include <util/threading.h> /* OBS threading API */
 
@@ -27,13 +28,21 @@ typedef enum {
   SYNC_STATE_SYNCHRONIZED /* synchronised */
 } sync_state_t;
 
+typedef enum {
+  SYNC_METHOD_UNKNOWN,
+  SYNC_METHOD_PTS_FALLBACK,
+  SYNC_METHOD_SEI_STAMPER_NTP,
+  SYNC_METHOD_MOBLIN_TIMECODE
+} sync_method_t;
+
 /* Video frame data */
 typedef struct video_frame_data {
   uint8_t *data;            /* frame data */
   size_t size;              /* data size */
-  int64_t pts;              /* presentation timestamp */
+  int64_t pts;              /* presentation timestamp in nanoseconds */
   ntp_timestamp_t ntp_time; /* NTP timestamp, extracted from the SEI */
   bool has_ntp;             /* whether an NTP timestamp is present */
+  sync_method_t timestamp_source; /* origin of this frame's absolute timestamp */
   uint32_t width;           /* video width */
   uint32_t height;          /* video height */
   enum video_format format; /* video format */
@@ -54,6 +63,7 @@ typedef struct sei_receiver_source {
 
   /* SRT connection */
   char srt_url[256];           /* SRT URL (may carry ?streamid=xxx etc.) */
+  uint32_t srt_rcvlatency_ms;  /* fixed SRT receive latency (120 ms) */
   bool is_connected;           /* whether connected */
   pthread_t receive_thread;    /* receive thread */
   volatile bool thread_active; /* thread-active flag */
@@ -96,6 +106,8 @@ typedef struct sei_receiver_source {
   /* PTS sync */
   int64_t pts_offset;  /* PTS to SystemTime offset */
   bool has_pts_offset; /* whether the offset has been computed */
+  sync_method_t sync_method; /* actual timestamp source in use */
+  sync_method_t absolute_sync_method; /* last validated absolute timestamp source */
 
   /* Audio decode */
   void *audio_codec_context;      /* FFmpeg audio codec context */
@@ -103,11 +115,24 @@ typedef struct sei_receiver_source {
   enum audio_format audio_format; /* OBS audio format */
   uint32_t audio_channels;        /* channel count */
   uint32_t audio_sample_rate;     /* sample rate */
+  int64_t audio_offset_ns;        /* manual audio-to-video calibration */
+  void *audio_resampler;          /* SwrContext*: decoder -> OBS audio format */
+  pthread_mutex_t audio_settings_lock;
+  bool audio_settings_lock_initialized;
+  int audio_resampler_sample_fmt;
+  int audio_resampler_sample_rate;
+  AVChannelLayout audio_resampler_layout;
 
   /* Statistics */
   uint64_t frames_received;       /* total frames received */
   uint64_t frames_rendered;       /* total frames rendered */
   uint64_t frames_dropped;        /* frames dropped */
+  uint64_t decode_errors_total;   /* cumulative video decoder errors */
+  uint64_t audio_frames_received; /* decoded audio frames output to OBS */
+  uint64_t rx_bytes_total;        /* demuxed packet bytes, cumulative */
+  uint64_t rx_bytes_window;       /* packet bytes since last bitrate sample */
+  uint64_t rx_bitrate_sample_ns;  /* monotonic sample time */
+  uint64_t rx_bitrate_bps;        /* measured receive bitrate */
   uint64_t sei_found_count;       /* frames where an SEI was found */
   uint64_t last_sync_frame_count; /* frame count at the last sync */
 
@@ -173,3 +198,4 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
 #ifdef __cplusplus
 }
 #endif
+

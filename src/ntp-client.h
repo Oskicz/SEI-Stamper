@@ -62,7 +62,10 @@ typedef struct ntp_client {
   pthread_t sync_thread;
   os_event_t *sync_stop;
   bool sync_thread_active;
+  bool sync_enabled;
+  bool shutdown_requested;
   uint32_t sync_interval_ms;
+  uint32_t config_generation;
 } ntp_client_t;
 
 /*
@@ -126,6 +129,12 @@ bool ntp_client_needs_resync(ntp_client_t *client, uint32_t max_age_seconds);
 void ntp_client_start_background_sync(ntp_client_t *client,
                                       uint32_t interval_ms);
 
+/* Update background-worker settings without performing network I/O or joining
+ * the worker. The next scheduled request uses the new endpoint/interval. */
+void ntp_client_update_settings(ntp_client_t *client, const char *server,
+                                uint16_t port, uint32_t interval_ms,
+                                bool enabled);
+
 /*
  * Destroy the NTP client
  * Params:
@@ -136,3 +145,4 @@ void ntp_client_destroy(ntp_client_t *client);
 #ifdef __cplusplus
 }
 #endif
+
