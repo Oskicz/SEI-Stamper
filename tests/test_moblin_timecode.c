@@ -69,6 +69,20 @@ static void test_reject_invalid_payloads(void)
   CHECK(!moblin_parse_timecode_payload(payload, sizeof(payload), &tc), "reject wrong clock count");
 }
 
+static void test_frame_rate_selection(void)
+{
+  int num = 0, den = 0;
+  CHECK(moblin_select_timecode_rate(60, 1, 15, 1, &num, &den),
+        "select nominal rate when observed output FPS falls");
+  CHECK(num == 60 && den == 1,
+        "LLB and dropped frames do not alter timecode frame numbering");
+  CHECK(moblin_select_timecode_rate(0, 1, 30, 1, &num, &den),
+        "fall back to average rate when nominal rate is unavailable");
+  CHECK(num == 30 && den == 1, "use valid fallback frame rate");
+  CHECK(!moblin_select_timecode_rate(0, 1, 0, 0, &num, &den),
+        "reject unavailable frame rates");
+}
+
 static void test_date_resolution(void)
 {
   moblin_timecode_t tc = {.hours = 0, .minutes = 0, .seconds = 0, .frame = 0};
@@ -94,6 +108,7 @@ int main(void)
 {
   test_moblin_annexb();
   test_reject_invalid_payloads();
+  test_frame_rate_selection();
   test_date_resolution();
   if (failures) return 1;
   puts("Moblin HEVC timecode tests passed");
