@@ -63,7 +63,10 @@ typedef struct sei_receiver_source {
 
   /* SRT connection */
   char srt_url[256];           /* SRT URL (may carry ?streamid=xxx etc.) */
-  uint32_t srt_rcvlatency_ms;  /* fixed SRT receive latency (120 ms) */
+  uint32_t srt_rcvlatency_ms;  /* adaptive SRT receiver buffer (default 120 ms) */
+  uint64_t last_latency_adjustment_ns;
+  uint8_t latency_adjustment_attempts;
+  bool latency_reconnect_pending;
   bool is_connected;           /* whether connected */
   pthread_t receive_thread;    /* receive thread */
   volatile bool thread_active; /* thread-active flag */
