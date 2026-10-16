@@ -13,7 +13,7 @@
 #include <libavutil/channel_layout.h>
 #include <obs-module.h>
 #include <util/threading.h> /* OBS threading API */
-#include <stdatomic.h>
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,8 +67,8 @@ typedef struct sei_receiver_source {
   bool is_connected;           /* whether connected */
   pthread_t receive_thread;    /* receive thread */
   volatile bool thread_active; /* thread-active flag */
-  atomic_bool reset_sync_requested;
-  atomic_bool reset_picture_requested;
+  bool reset_sync_requested;
+  bool reset_picture_requested;
   int64_t last_video_pts_ns;
   uint64_t last_video_output_mono_ns;
   bool video_output_cleared;

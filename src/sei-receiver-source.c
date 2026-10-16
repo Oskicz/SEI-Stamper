@@ -332,8 +332,14 @@ static void clear_output_video(sei_receiver_source_t *source)
 static int interrupt_if_video_stale(void *opaque)
 {
   sei_receiver_source_t *source = (sei_receiver_source_t *)opaque;
-  if (source && atomic_load(&source->reset_picture_requested))
-    return 1;
+  if (source) {
+    bool reset_requested;
+    pthread_mutex_lock(&source->audio_settings_lock);
+    reset_requested = source->reset_picture_requested;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+    if (reset_requested)
+      return 1;
+  }
   if (!source || !source->thread_active || !source->last_video_output_mono_ns ||
       source->video_output_cleared)
     return 0;
@@ -1001,8 +1007,8 @@ static void *receiver_source_create(obs_data_t *settings,
                                     obs_source_t *source) {
   sei_receiver_source_t *ctx = bzalloc(sizeof(sei_receiver_source_t));
   ctx->context = source;
-  atomic_init(&ctx->reset_sync_requested, false);
-  atomic_init(&ctx->reset_picture_requested, false);
+  ctx->reset_sync_requested = false;
+  ctx->reset_picture_requested = false;
   ctx->last_video_pts_ns = AV_NOPTS_VALUE;
   ctx->video_output_cleared = true;
 
@@ -1251,8 +1257,11 @@ static bool reset_sync_button(obs_properties_t *props, obs_property_t *property,
   UNUSED_PARAMETER(props);
   UNUSED_PARAMETER(property);
   sei_receiver_source_t *source = (sei_receiver_source_t *)data;
-  if (source)
-    atomic_store(&source->reset_sync_requested, true);
+  if (source) {
+    pthread_mutex_lock(&source->audio_settings_lock);
+    source->reset_sync_requested = true;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+  }
   return true;
 }
 
@@ -1262,8 +1271,11 @@ static bool reset_picture_button(obs_properties_t *props,
   UNUSED_PARAMETER(props);
   UNUSED_PARAMETER(property);
   sei_receiver_source_t *source = (sei_receiver_source_t *)data;
-  if (source)
-    atomic_store(&source->reset_picture_requested, true);
+  if (source) {
+    pthread_mutex_lock(&source->audio_settings_lock);
+    source->reset_picture_requested = true;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+  }
   return true;
 }
 
@@ -1614,12 +1626,19 @@ static void *srt_receive_thread(void *data) {
   AVPacket *packet = av_packet_alloc();
 
   while (source->thread_active) {
-    if (atomic_exchange(&source->reset_picture_requested, false)) {
+    pthread_mutex_lock(&source->audio_settings_lock);
+    bool reset_picture = source->reset_picture_requested;
+    source->reset_picture_requested = false;
+    bool reset_sync = source->reset_sync_requested;
+    source->reset_sync_requested = false;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+
+    if (reset_picture) {
       receiver_log(LOG_WARNING, source,
                    "Picture reset requested; reconnecting decoder and input");
       cleanup_connection(source);
     }
-    if (atomic_exchange(&source->reset_sync_requested, false)) {
+    if (reset_sync) {
       source->has_pts_offset = false;
       source->pts_offset = 0;
       source->sync_method = SYNC_METHOD_UNKNOWN;
