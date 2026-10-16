@@ -71,6 +71,7 @@ void multicam_status_set_connection(void *key, bool connected,
       slot->value.last_audio_mono_ns = 0;
       slot->value.last_packet_mono_ns = 0;
       slot->value.last_absolute_unix_ns = 0;
+      slot->value.observed_latency_ns = 0;
       slot->value.rx_bitrate_bps = 0;
       slot->value.rx_bitrate_5s_bps = 0;
       slot->packet_window_bytes = 0;
@@ -113,6 +114,7 @@ void multicam_status_add_packet(void *key, size_t bytes, uint64_t now_ns)
 
 void multicam_status_video(void *key, multicam_status_sync_method_t method,
                            bool ntp_fresh, int64_t absolute_unix_ns,
+                           uint64_t observed_latency_ns,
                            uint32_t width, uint32_t height,
                            int64_t video_offset_ns, uint64_t now_ns)
 {
@@ -124,6 +126,7 @@ void multicam_status_video(void *key, multicam_status_sync_method_t method,
     slot->value.sync_method = method;
     slot->value.ntp_fresh = ntp_fresh;
     slot->value.last_absolute_unix_ns = absolute_unix_ns > 0 ? (uint64_t)absolute_unix_ns : 0;
+    slot->value.observed_latency_ns = ntp_fresh ? observed_latency_ns : 0;
     slot->value.width = width;
     slot->value.height = height;
     slot->value.video_offset_ns = video_offset_ns;
@@ -169,6 +172,14 @@ void multicam_status_set_decode_errors(void *key, uint64_t errors)
   pthread_mutex_unlock(&status_lock);
 }
 
+void multicam_status_set_audio_decode_errors(void *key, uint64_t errors)
+{
+  pthread_mutex_lock(&status_lock);
+  status_slot_t *slot = find_slot(key);
+  if (slot) slot->value.audio_decode_errors = errors;
+  pthread_mutex_unlock(&status_lock);
+}
+
 size_t multicam_status_snapshot(multicam_source_status_t *out, size_t capacity)
 {
   if (!out || !capacity) return 0;
@@ -204,15 +215,17 @@ bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
 {
   if (!statuses || count == 0) return false;
   uint64_t minimum = UINT64_MAX, maximum = 0;
+  bool all_ready = true;
   for (size_t i = 0; i < count; ++i) {
     const multicam_source_status_t *s = &statuses[i];
-    if (!multicam_status_source_ready(s, now_ns)) return false;
+    if (!multicam_status_source_ready(s, now_ns)) all_ready = false;
     uint64_t t = s->last_absolute_unix_ns;
+    if (!t) return false;
     if (t < minimum) minimum = t;
     if (t > maximum) maximum = t;
   }
   uint64_t spread = maximum - minimum;
   if (spread_ns) *spread_ns = spread;
-  return spread <= tolerance_ns;
+  return all_ready && spread <= tolerance_ns;
 }
 

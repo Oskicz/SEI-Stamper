@@ -90,11 +90,27 @@ static void test_date_resolution(void)
   CHECK(!moblin_timecode_resolve_unix_ns(&tc, 0, 0, 1, &resolved), "reject missing frame rate");
 }
 
+static void test_nominal_rate_survives_llb(void)
+{
+  int fps_num = 0, fps_den = 0;
+  CHECK(moblin_select_timecode_rate(60, 1, 30, 1, &fps_num, &fps_den),
+        "select nominal rate when observed cadence falls under LLB");
+  CHECK(fps_num == 60 && fps_den == 1,
+        "LLB cadence does not change the timecode clock rate");
+  CHECK(moblin_select_timecode_rate(0, 1, 30000, 1001, &fps_num, &fps_den),
+        "fall back to average rate when nominal rate is missing");
+  CHECK(fps_num == 30000 && fps_den == 1001,
+        "preserve rational fallback frame rate");
+  CHECK(!moblin_select_timecode_rate(0, 0, 0, 0, &fps_num, &fps_den),
+        "reject missing nominal and average rates");
+}
+
 int main(void)
 {
   test_moblin_annexb();
   test_reject_invalid_payloads();
   test_date_resolution();
+  test_nominal_rate_survives_llb();
   if (failures) return 1;
   puts("Moblin HEVC timecode tests passed");
   return 0;

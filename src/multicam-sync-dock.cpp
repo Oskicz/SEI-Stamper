@@ -117,6 +117,10 @@ void refresh()
     tableWidget->setItem(row, 11, cell(delta, delta_color));
     tableWidget->setItem(row, 12, cell(QString::number(s.decode_errors),
                                       s.decode_errors ? bad : good));
+    tableWidget->item(row, 12)->setText(
+        QStringLiteral("V %1 / A %2").arg(s.decode_errors).arg(s.audio_decode_errors));
+    if (s.audio_decode_errors)
+      tableWidget->item(row, 12)->setForeground(bad);
   }
 
   uint64_t spread_ns = 0;
@@ -172,9 +176,13 @@ void exportReport()
     item.insert(QStringLiteral("demuxed_rx_payload_bps_1s"), static_cast<qint64>(s.rx_bitrate_bps));
     item.insert(QStringLiteral("demuxed_rx_payload_bps_5s_average"), static_cast<qint64>(s.rx_bitrate_5s_bps));
     item.insert(QStringLiteral("video_pts_offset_ns"), static_cast<qint64>(s.video_offset_ns));
+    item.insert(QStringLiteral("observed_input_latency_ms"),
+                s.observed_latency_ns / 1000000.0);
     item.insert(QStringLiteral("fps"), s.fps_milli / 1000.0);
     item.insert(QStringLiteral("ready"), ready);
     item.insert(QStringLiteral("decode_errors_total"), static_cast<qint64>(s.decode_errors));
+    item.insert(QStringLiteral("audio_decode_errors_total"),
+                static_cast<qint64>(s.audio_decode_errors));
     cameras.append(item);
   }
   bool aligned = count >= 2 && all_ready && multicam_status_group_aligned(sources, count, now,
@@ -214,7 +222,7 @@ extern "C" void multicam_sync_dock_load(void)
       QStringLiteral("NTP"), QStringLiteral("RX payload (1 s)"),
       QStringLiteral("RX payload (5 s avg)"),
       QStringLiteral("FPS"), QStringLiteral("Video PTS offset"), QStringLiteral("Δ camera"),
-      QStringLiteral("Decode errors")});
+      QStringLiteral("Decode errors (video/audio)")});
   tableWidget->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
   tableWidget->horizontalHeader()->setStretchLastSection(true);
   tableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);

@@ -8,10 +8,16 @@ int main(void)
   multicam_status_set_connection(&key, true, "hevc", true, 1920, 1080);
   multicam_status_add_packet(&key, 1000, 1000000000ULL);
   multicam_status_add_packet(&key, 1000, 2000000000ULL);
+  multicam_status_video(&key, MULTICAM_SYNC_MOBLIN_TIMECODE, true,
+                        900000000000LL, 550000000ULL, 1920, 1080, 0,
+                        2000000000ULL);
   multicam_source_status_t measured = {0};
   if (multicam_status_snapshot(&measured, 1) != 1 ||
       measured.rx_bitrate_bps != 16000 || measured.rx_bitrate_5s_bps != 16000 || !measured.has_audio ||
-      measured.connected == false) return 7;
+      measured.connected == false || measured.observed_latency_ns != 550000000ULL) return 7;
+  multicam_status_set_audio_decode_errors(&key, 3);
+  if (multicam_status_snapshot(&measured, 1) != 1 ||
+      measured.audio_decode_errors != 3) return 9;
   multicam_status_set_connection(&key, false, NULL, false, 0, 0);
   if (multicam_status_snapshot(&measured, 1) != 1 || measured.connected ||
       measured.rx_bitrate_bps || measured.last_video_mono_ns) return 8;
@@ -39,6 +45,9 @@ int main(void)
   cameras[1].sync_method = MULTICAM_SYNC_MOBLIN_TIMECODE;
   cameras[1].last_video_mono_ns = 1;
   if (multicam_status_source_ready(&cameras[1], now)) return 6;
+  spread = 0;
+  if (multicam_status_group_aligned(cameras, 2, now, 16666667ULL, &spread) ||
+      spread != 15000000ULL) return 10;
   puts("Multicam status and conservative preflight tests passed");
   return 0;
 }

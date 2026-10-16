@@ -44,6 +44,23 @@ static inline int64_t receiver_pts_to_ns(int64_t pts, int time_base_num,
   return (int64_t)(ns >= 0 ? ns + 0.5L : ns - 0.5L);
 }
 
+static inline bool receiver_pts_has_backward_reset(int64_t previous_pts_ns,
+                                                    int64_t current_pts_ns,
+                                                    uint64_t threshold_ns)
+{
+  return current_pts_ns < previous_pts_ns &&
+         (long double)previous_pts_ns - (long double)current_pts_ns >
+             (long double)threshold_ns;
+}
+
+static inline bool receiver_video_is_stale(uint64_t last_frame_mono_ns,
+                                           uint64_t now_mono_ns,
+                                           uint64_t timeout_ns)
+{
+  return last_frame_mono_ns && now_mono_ns >= last_frame_mono_ns &&
+         now_mono_ns - last_frame_mono_ns >= timeout_ns;
+}
+
 static inline bool receiver_ntp_to_unix_ns(uint32_t seconds, uint32_t fraction,
                                            int64_t *unix_ns)
 {

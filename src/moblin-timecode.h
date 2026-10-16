@@ -16,6 +16,30 @@ typedef struct moblin_timecode {
   bool unit_field_based;
 } moblin_timecode_t;
 
+/* Time-code frame indexes use the stream's nominal rate, not the observed
+ * output cadence. Prefer r_frame_rate so LLB and dropped frames do not change
+ * how the time field maps to wall-clock time. */
+static inline bool moblin_select_timecode_rate(int nominal_num,
+                                                int nominal_den,
+                                                int average_num,
+                                                int average_den,
+                                                int *fps_num,
+                                                int *fps_den)
+{
+  if (!fps_num || !fps_den) return false;
+  int num = nominal_num;
+  int den = nominal_den;
+  if (num <= 0 || den <= 0 || (long double)num / den > 1000.0L) {
+    num = average_num;
+    den = average_den;
+  }
+  if (num <= 0 || den <= 0 || (long double)num / den > 1000.0L)
+    return false;
+  *fps_num = num;
+  *fps_den = den;
+  return true;
+}
+
 typedef struct moblin_bit_reader {
   const uint8_t *data;
   size_t bit_count;

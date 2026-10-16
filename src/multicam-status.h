@@ -28,9 +28,11 @@ typedef struct multicam_source_status {
   uint32_t width, height;
   uint64_t video_frames, audio_frames;
   uint64_t decode_errors;
+  uint64_t audio_decode_errors;
   uint64_t last_packet_mono_ns;
   uint64_t last_video_mono_ns, last_audio_mono_ns;
   uint64_t last_absolute_unix_ns;
+  uint64_t observed_latency_ns;
   uint64_t rx_bytes_total, rx_bitrate_bps;
   uint64_t rx_bitrate_5s_bps;
   int64_t video_offset_ns;
@@ -45,11 +47,13 @@ void multicam_status_set_connection(void *key, bool connected,
 void multicam_status_add_packet(void *key, size_t bytes, uint64_t now_ns);
 void multicam_status_video(void *key, multicam_status_sync_method_t method,
                            bool ntp_fresh, int64_t absolute_unix_ns,
+                           uint64_t observed_latency_ns,
                            uint32_t width, uint32_t height,
                            int64_t video_offset_ns, uint64_t now_ns);
 void multicam_status_audio(void *key, uint64_t now_ns);
 void multicam_status_set_audio_offset(void *key, int32_t offset_ms);
 void multicam_status_set_decode_errors(void *key, uint64_t errors);
+void multicam_status_set_audio_decode_errors(void *key, uint64_t errors);
 size_t multicam_status_snapshot(multicam_source_status_t *out, size_t capacity);
 
 /* A preflight passes only when every required signal is present. This is

@@ -731,6 +731,18 @@ int main(void) {
             "video PTS at 90 kHz converts to one second in ns");
   ASSERT_EQ(receiver_pts_to_ns(-24000, 1, 48000), -500000000LL,
             "negative PTS preserves signed nanoseconds");
+  ASSERT_TRUE(receiver_pts_has_backward_reset(10000000000LL, 1000000000LL,
+                                               500000000ULL),
+              "detect a video PTS reset when a live source changes");
+  ASSERT_TRUE(!receiver_pts_has_backward_reset(10000000000LL, 9900000000LL,
+                                                500000000ULL),
+              "ignore a small PTS rewind below the reset threshold");
+  ASSERT_TRUE(receiver_video_is_stale(10000000000ULL, 12000000000ULL,
+                                      2000000000ULL),
+              "clear video at the two-second stale threshold");
+  ASSERT_TRUE(!receiver_video_is_stale(10000000000ULL, 11999999999ULL,
+                                       2000000000ULL),
+              "keep video visible before the stale threshold");
   ASSERT_EQ(receiver_pts_to_ns(1, 0, 48000), 0,
             "invalid time base is rejected");
   int64_t display_ns = 0;
