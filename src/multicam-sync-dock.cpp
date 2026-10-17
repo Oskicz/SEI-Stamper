@@ -60,9 +60,13 @@ uint64_t group_spread(const multicam_source_status_t *statuses, size_t count)
 {
   uint64_t minimum = UINT64_MAX, maximum = 0;
   for (size_t i = 0; i < count; ++i) {
-    if (!statuses[i].last_absolute_unix_ns) return 0;
-    minimum = std::min(minimum, statuses[i].last_absolute_unix_ns);
-    maximum = std::max(maximum, statuses[i].last_absolute_unix_ns);
+    if (!statuses[i].last_absolute_unix_ns ||
+        statuses[i].last_absolute_unix_ns < statuses[i].playout_delay_ns)
+      return 0;
+    const uint64_t playout_time = statuses[i].last_absolute_unix_ns -
+                                  statuses[i].playout_delay_ns;
+    minimum = std::min(minimum, playout_time);
+    maximum = std::max(maximum, playout_time);
   }
   return count ? maximum - minimum : 0;
 }
@@ -113,7 +117,9 @@ void refresh()
     QString delta = QStringLiteral("—");
     QColor delta_color = neutral;
     if (s.last_absolute_unix_ns && absolute_count > 1) {
-      const int64_t d = static_cast<int64_t>(s.last_absolute_unix_ns) - static_cast<int64_t>(absolute_sources[0].last_absolute_unix_ns);
+      const int64_t playout_ns = static_cast<int64_t>(s.last_absolute_unix_ns - s.playout_delay_ns);
+      const int64_t reference_ns = static_cast<int64_t>(absolute_sources[0].last_absolute_unix_ns - absolute_sources[0].playout_delay_ns);
+      const int64_t d = playout_ns - reference_ns;
       delta = QStringLiteral("%1 ms").arg(d / 1000000.0, 0, 'f', 1);
       switch (multicam_status_sync_quality(spread)) {
       case MULTICAM_SYNC_QUALITY_EXCELLENT: delta_color = QColor(70, 150, 255); break;
@@ -136,7 +142,7 @@ void refresh()
   bool aligned = absolute_count >= 2 &&
       multicam_status_group_aligned(absolute_sources, absolute_count, now,
                                     kAlignmentToleranceNs, &spread_ns);
-  summaryLabel->setText(QStringLiteral("Receivers: %1 | Preflight: %2 | Input timestamp spread: %3 ms")
+  summaryLabel->setText(QStringLiteral("Receivers: %1 | Preflight: %2 | Scheduled output spread: %3 ms")
                             .arg(count).arg(count && ready_count == static_cast<int>(count) && aligned ? QStringLiteral("READY") : QStringLiteral("CHECK"))
                             .arg(absolute_count > 1 ? spread_ns / 1000000.0 : 0.0, 0, 'f', 1));
 }
@@ -152,8 +158,8 @@ void runPreflight()
   bool aligned = count >= 2 && all_ready && multicam_status_group_aligned(
       sources, count, now, kAlignmentToleranceNs, &spread);
   const QString result = aligned
-      ? QStringLiteral("READY: receivers have recent video, expected audio flow, measured RX bitrate, fresh NTP and absolute timestamps. Inter-camera input timestamp spread is %1 ms (strict preflight target ≤16.67 ms). Audio lip-sync still requires playback verification.").arg(spread / 1000000.0, 0, 'f', 1)
-      : QStringLiteral("CHECK: preflight did not pass. Verify every receiver is connected, video/audio are current, RX bitrate is measured, NTP is fresh, metadata is absolute (not PTS fallback), and input timestamp spread is ≤16.67 ms. This measures newest received frames, not scheduled playout alignment.");
+      ? QStringLiteral("READY: receivers have recent video, expected audio flow, measured RX bitrate, fresh NTP and absolute timestamps. Estimated scheduled output spread is %1 ms (strict preflight target ≤16.67 ms). Audio lip-sync still requires playback verification.").arg(spread / 1000000.0, 0, 'f', 1)
+      : QStringLiteral("CHECK: preflight did not pass. Verify every receiver is connected, video/audio are current, RX bitrate is measured, NTP is fresh, metadata is absolute (not PTS fallback), and estimated scheduled output spread is ≤16.67 ms.");
   QMessageBox::information(dockWidget, QStringLiteral("Multicam preflight"), result);
 }
 
@@ -187,6 +193,8 @@ void exportReport()
     item.insert(QStringLiteral("video_pts_offset_ns"), static_cast<qint64>(s.video_offset_ns));
     item.insert(QStringLiteral("observed_input_latency_ms"),
                 s.observed_latency_ns / 1000000.0);
+    item.insert(QStringLiteral("scheduled_playout_delay_ms"),
+                s.playout_delay_ns / 1000000.0);
     item.insert(QStringLiteral("fps"), s.fps_milli / 1000.0);
     item.insert(QStringLiteral("ready"), ready);
     item.insert(QStringLiteral("decode_errors_total"), static_cast<qint64>(s.decode_errors));

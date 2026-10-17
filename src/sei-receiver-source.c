@@ -39,6 +39,8 @@
 #define SRT_BUFFER_SIZE (1024 * 1024) /* 1MB */
 #define VIDEO_STALE_TIMEOUT_NS 2000000000ULL
 #define PTS_BACKWARD_RESET_NS 500000000ULL
+#define MAX_SYNC_PLAYOUT_DELAY_NS 5000000000ULL
+#define PLAYOUT_DELAY_UPDATE_THRESHOLD_NS 250000000ULL
 
 /*============================================================================
  * Frame buffer management
@@ -350,6 +352,59 @@ static int interrupt_if_video_stale(void *opaque)
     return 1;
   }
   return 0;
+}
+
+typedef struct playout_filter_update {
+  obs_source_t *filter;
+  uint32_t delay_ms;
+} playout_filter_update_t;
+
+static void apply_playout_filter_update(void *opaque)
+{
+  playout_filter_update_t *update = (playout_filter_update_t *)opaque;
+  if (!update) return;
+  obs_data_t *settings = obs_data_create();
+  obs_data_set_int(settings, "delay_ms", update->delay_ms);
+  obs_source_update(update->filter, settings);
+  obs_data_release(settings);
+  obs_source_release(update->filter);
+  bfree(update);
+}
+
+static void schedule_playout_delay(sei_receiver_source_t *source,
+                                  uint64_t delay_ns)
+{
+  if (!source) return;
+  if (delay_ns > MAX_SYNC_PLAYOUT_DELAY_NS)
+    delay_ns = MAX_SYNC_PLAYOUT_DELAY_NS;
+  uint64_t difference = delay_ns > source->playout_delay_ns
+                            ? delay_ns - source->playout_delay_ns
+                            : source->playout_delay_ns - delay_ns;
+  if (difference < PLAYOUT_DELAY_UPDATE_THRESHOLD_NS) return;
+
+  if (!source->playout_delay_filter) {
+    source->playout_delay_ns = 0;
+    multicam_status_set_playout_delay(source, 0);
+    if (!source->playout_filter_warning_logged) {
+      source->playout_filter_warning_logged = true;
+      receiver_log(LOG_WARNING, source,
+                   "OBS async-delay filter unavailable; cannot align this receiver's playout");
+    }
+    return;
+  }
+  source->playout_delay_ns = delay_ns;
+  multicam_status_set_playout_delay(source, delay_ns);
+
+  playout_filter_update_t *update = bzalloc(sizeof(*update));
+  if (!update) return;
+  update->filter = source->playout_delay_filter;
+  update->delay_ms = (uint32_t)((delay_ns + 500000ULL) / 1000000ULL);
+  uint32_t delay_ms = update->delay_ms;
+  obs_source_addref(update->filter);
+  obs_queue_task(OBS_TASK_UI, apply_playout_filter_update, update, false);
+  receiver_log(LOG_INFO, source,
+               "Scheduling OBS playout delay update: %u ms (group maximum input age)",
+               delay_ms);
 }
 
 static void clear_if_video_stale(sei_receiver_source_t *source)
@@ -690,6 +745,13 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                         observed_latency_ns,
                         frame_out->width, frame_out->height, source->pts_offset,
                         status_now_ns);
+  if (ntp_fresh && absolute_unix_ns > 0) {
+    uint64_t group_max_latency =
+        multicam_status_group_max_latency_ns(status_now_ns);
+    schedule_playout_delay(
+        source, multicam_status_playout_delay(group_max_latency,
+                                              observed_latency_ns));
+  }
 
   /* Debug log: confirm the timestamp */
   receiver_log(
@@ -1025,6 +1087,20 @@ static void *receiver_source_create(obs_data_t *settings,
   ctx->audio_settings_lock_initialized = true;
   multicam_status_register(ctx, obs_source_get_name(source));
 
+  /* OBS timestamps old async frames as late and caps its queued frames at 30.
+   * Keep a real bounded playout delay in OBS's stock filter so faster inputs
+   * can wait for a slower Moblin path without falsifying their timestamps. */
+  obs_data_t *delay_settings = obs_data_create();
+  obs_data_set_int(delay_settings, "delay_ms", 0);
+  ctx->playout_delay_filter = obs_source_create_private(
+      "async_delay_filter", "SEI Sync Playout Delay", delay_settings);
+  obs_data_release(delay_settings);
+  if (ctx->playout_delay_filter)
+    obs_source_filter_add(ctx->context, ctx->playout_delay_filter);
+  else
+    receiver_log(LOG_WARNING, ctx,
+                 "OBS async-delay filter was not available; adaptive playout alignment is disabled");
+
   /* Initialise the sync state */
   ctx->sync_state = SYNC_STATE_WAITING;
   ctx->has_pts_offset = false;
@@ -1116,6 +1192,11 @@ static void receiver_source_destroy(void *data) {
   /* Stop the receiver */
   stop_receiver(ctx);
   multicam_status_unregister(ctx);
+  if (ctx->playout_delay_filter) {
+    obs_source_filter_remove(ctx->context, ctx->playout_delay_filter);
+    obs_source_release(ctx->playout_delay_filter);
+    ctx->playout_delay_filter = NULL;
+  }
 
   /* avformat owns the SRT connection; no manual socket close */
 
@@ -1426,6 +1507,7 @@ static void cleanup_connection(sei_receiver_source_t *source) {
   source->last_video_pts_ns = AV_NOPTS_VALUE;
   source->last_video_output_mono_ns = 0;
   source->video_output_cleared = true;
+  schedule_playout_delay(source, 0);
   multicam_status_set_connection(source, false, NULL, false, 0, 0);
   receiver_log(LOG_INFO, source, "Connection closed and resources freed");
 }
@@ -1644,6 +1726,7 @@ static void *srt_receive_thread(void *data) {
       source->sync_method = SYNC_METHOD_UNKNOWN;
       source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
       source->last_video_pts_ns = AV_NOPTS_VALUE;
+      schedule_playout_delay(source, 0);
       receiver_log(LOG_INFO, source,
                    "Synchronization reset requested; waiting for a fresh absolute timestamp");
     }
@@ -1780,4 +1863,5 @@ struct obs_source_info sei_receiver_source_info = {
     .get_width = receiver_source_get_width,
     .get_height = receiver_source_get_height,
 };
+
 

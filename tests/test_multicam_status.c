@@ -9,6 +9,10 @@ int main(void)
       multicam_status_sync_quality(100000000ULL) != MULTICAM_SYNC_QUALITY_WARNING ||
       multicam_status_sync_quality(249999999ULL) != MULTICAM_SYNC_QUALITY_WARNING ||
       multicam_status_sync_quality(250000000ULL) != MULTICAM_SYNC_QUALITY_BAD) return 11;
+  if (multicam_status_playout_delay(3900000000ULL, 2330000000ULL) !=
+          1570000000ULL ||
+      multicam_status_playout_delay(2330000000ULL, 3900000000ULL) != 0)
+    return 12;
 
   int key;
   multicam_status_register(&key, "Private source name");
@@ -21,7 +25,11 @@ int main(void)
   multicam_source_status_t measured = {0};
   if (multicam_status_snapshot(&measured, 1) != 1 ||
       measured.rx_bitrate_bps != 16000 || measured.rx_bitrate_5s_bps != 16000 || !measured.has_audio ||
-      measured.connected == false || measured.observed_latency_ns != 550000000ULL) return 7;
+      measured.connected == false || measured.observed_latency_ns != 550000000ULL ||
+      multicam_status_group_max_latency_ns(2000000000ULL) != 550000000ULL) return 7;
+  multicam_status_set_playout_delay(&key, 1250000000ULL);
+  if (multicam_status_snapshot(&measured, 1) != 1 ||
+      measured.playout_delay_ns != 1250000000ULL) return 14;
   multicam_status_set_audio_decode_errors(&key, 3);
   if (multicam_status_snapshot(&measured, 1) != 1 ||
       measured.audio_decode_errors != 3) return 9;
@@ -35,10 +43,10 @@ int main(void)
     {.connected = true, .ntp_fresh = true, .sync_method = MULTICAM_SYNC_SEI_STAMPER_NTP,
      .last_video_mono_ns = now, .last_audio_mono_ns = now, .has_audio = true,
      .last_packet_mono_ns = now,
-     .last_absolute_unix_ns = 100000000000ULL, .rx_bitrate_bps = 1000000},
+     .last_absolute_unix_ns = 100015000000ULL, .rx_bitrate_bps = 1000000},
     {.connected = true, .ntp_fresh = true, .sync_method = MULTICAM_SYNC_MOBLIN_TIMECODE,
      .last_packet_mono_ns = now, .last_video_mono_ns = now,
-     .last_absolute_unix_ns = 100015000000ULL,
+     .last_absolute_unix_ns = 100000000000ULL,
      .rx_bitrate_bps = 800000}
   };
   uint64_t spread = 0;
@@ -47,6 +55,10 @@ int main(void)
   if (!multicam_status_group_aligned(cameras, 2, now, 16666667ULL, &spread) ||
       spread != 15000000ULL) return 3;
   if (multicam_status_group_aligned(cameras, 2, now, 10000000ULL, NULL)) return 4;
+  cameras[0].playout_delay_ns = 15000000ULL;
+  if (!multicam_status_group_aligned(cameras, 2, now, 16666667ULL, &spread) ||
+      spread != 0) return 13;
+  cameras[0].playout_delay_ns = 0;
   cameras[1].sync_method = MULTICAM_SYNC_PTS_FALLBACK;
   if (multicam_status_source_ready(&cameras[1], now)) return 5;
   cameras[1].sync_method = MULTICAM_SYNC_MOBLIN_TIMECODE;

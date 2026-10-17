@@ -220,6 +220,8 @@ bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
     const multicam_source_status_t *s = &statuses[i];
     if (!multicam_status_source_ready(s, now_ns)) all_ready = false;
     uint64_t t = s->last_absolute_unix_ns;
+    if (t < s->playout_delay_ns) return false;
+    t -= s->playout_delay_ns;
     if (!t) return false;
     if (t < minimum) minimum = t;
     if (t > maximum) maximum = t;
@@ -235,6 +237,38 @@ multicam_sync_quality_t multicam_status_sync_quality(uint64_t spread_ns)
   if (spread_ns < 100000000ULL) return MULTICAM_SYNC_QUALITY_GOOD;
   if (spread_ns < 250000000ULL) return MULTICAM_SYNC_QUALITY_WARNING;
   return MULTICAM_SYNC_QUALITY_BAD;
+}
+
+uint64_t multicam_status_playout_delay(uint64_t group_max_latency_ns,
+                                       uint64_t source_latency_ns)
+{
+  return group_max_latency_ns > source_latency_ns
+             ? group_max_latency_ns - source_latency_ns : 0;
+}
+
+uint64_t multicam_status_group_max_latency_ns(uint64_t now_ns)
+{
+  uint64_t maximum = 0;
+  pthread_mutex_lock(&status_lock);
+  for (size_t i = 0; i < MULTICAM_STATUS_MAX_SOURCES; ++i) {
+    const multicam_source_status_t *s = &slots[i].value;
+    if (slots[i].key && s->connected && s->ntp_fresh &&
+        (s->sync_method == MULTICAM_SYNC_SEI_STAMPER_NTP ||
+         s->sync_method == MULTICAM_SYNC_MOBLIN_TIMECODE) &&
+        is_recent(s->last_video_mono_ns, now_ns) &&
+        s->observed_latency_ns > maximum)
+      maximum = s->observed_latency_ns;
+  }
+  pthread_mutex_unlock(&status_lock);
+  return maximum;
+}
+
+void multicam_status_set_playout_delay(void *key, uint64_t delay_ns)
+{
+  pthread_mutex_lock(&status_lock);
+  status_slot_t *slot = find_slot(key);
+  if (slot) slot->value.playout_delay_ns = delay_ns;
+  pthread_mutex_unlock(&status_lock);
 }
 
 

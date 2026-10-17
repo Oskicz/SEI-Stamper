@@ -72,6 +72,9 @@ typedef struct sei_receiver_source {
   int64_t last_video_pts_ns;
   uint64_t last_video_output_mono_ns;
   bool video_output_cleared;
+  obs_source_t *playout_delay_filter;
+  uint64_t playout_delay_ns;
+  bool playout_filter_warning_logged;
 
   /* Video decode */
   void *format_context;       /* FFmpeg format context (demux) */
@@ -204,4 +207,5 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
 #ifdef __cplusplus
 }
 #endif
+
 
