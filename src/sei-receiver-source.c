@@ -40,7 +40,7 @@
 #define VIDEO_STALE_TIMEOUT_NS 2000000000ULL
 #define PTS_BACKWARD_RESET_NS 500000000ULL
 #define MAX_SYNC_PLAYOUT_DELAY_NS 2000000000ULL
-#define PLAYOUT_DELAY_UPDATE_THRESHOLD_NS 25000000ULL
+#define PLAYOUT_DELAY_UPDATE_THRESHOLD_NS 15000000ULL
 
 /*============================================================================
  * Frame buffer management
