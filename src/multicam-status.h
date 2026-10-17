@@ -40,6 +40,7 @@ typedef struct multicam_source_status {
   uint64_t last_video_mono_ns, last_audio_mono_ns;
   uint64_t last_absolute_unix_ns;
   uint64_t observed_latency_ns;
+  uint64_t sync_latency_ns;
   uint64_t playout_delay_ns;
   uint64_t rx_bytes_total, rx_bitrate_bps;
   uint64_t rx_bitrate_5s_bps;
@@ -77,6 +78,7 @@ uint64_t multicam_status_playout_delay(uint64_t group_max_latency_ns,
                                        uint64_t source_latency_ns);
 uint64_t multicam_status_group_max_latency_ns(uint64_t now_ns);
 void multicam_status_set_playout_delay(void *key, uint64_t delay_ns);
+void multicam_status_set_sync_latency(void *key, uint64_t latency_ns);
 
 #ifdef __cplusplus
 }

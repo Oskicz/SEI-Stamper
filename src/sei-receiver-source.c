@@ -39,8 +39,8 @@
 #define SRT_BUFFER_SIZE (1024 * 1024) /* 1MB */
 #define VIDEO_STALE_TIMEOUT_NS 2000000000ULL
 #define PTS_BACKWARD_RESET_NS 500000000ULL
-#define MAX_SYNC_PLAYOUT_DELAY_NS 5000000000ULL
-#define PLAYOUT_DELAY_UPDATE_THRESHOLD_NS 250000000ULL
+#define MAX_SYNC_PLAYOUT_DELAY_NS 2000000000ULL
+#define PLAYOUT_DELAY_UPDATE_THRESHOLD_NS 25000000ULL
 
 /*============================================================================
  * Frame buffer management
@@ -372,15 +372,21 @@ static void apply_playout_filter_update(void *opaque)
 }
 
 static void schedule_playout_delay(sei_receiver_source_t *source,
-                                  uint64_t delay_ns)
+                                  uint64_t delay_ns, bool force)
 {
   if (!source) return;
-  if (delay_ns > MAX_SYNC_PLAYOUT_DELAY_NS)
+  if (delay_ns > MAX_SYNC_PLAYOUT_DELAY_NS) {
+    if (!source->playout_delay_cap_warning_logged) {
+      source->playout_delay_cap_warning_logged = true;
+      receiver_log(LOG_WARNING, source,
+                   "Required playout delay exceeds the 2000 ms safety cap; output may remain misaligned");
+    }
     delay_ns = MAX_SYNC_PLAYOUT_DELAY_NS;
+  }
   uint64_t difference = delay_ns > source->playout_delay_ns
                             ? delay_ns - source->playout_delay_ns
                             : source->playout_delay_ns - delay_ns;
-  if (difference < PLAYOUT_DELAY_UPDATE_THRESHOLD_NS) return;
+  if (!force && difference < PLAYOUT_DELAY_UPDATE_THRESHOLD_NS) return;
 
   if (!source->playout_delay_filter) {
     source->playout_delay_ns = 0;
@@ -392,9 +398,6 @@ static void schedule_playout_delay(sei_receiver_source_t *source,
     }
     return;
   }
-  source->playout_delay_ns = delay_ns;
-  multicam_status_set_playout_delay(source, delay_ns);
-
   playout_filter_update_t *update = bzalloc(sizeof(*update));
   if (!update) return;
   update->filter = source->playout_delay_filter;
@@ -402,6 +405,8 @@ static void schedule_playout_delay(sei_receiver_source_t *source,
   uint32_t delay_ms = update->delay_ms;
   obs_source_addref(update->filter);
   obs_queue_task(OBS_TASK_UI, apply_playout_filter_update, update, false);
+  source->playout_delay_ns = delay_ns;
+  multicam_status_set_playout_delay(source, delay_ns);
   receiver_log(LOG_INFO, source,
                "Scheduling OBS playout delay update: %u ms (group maximum input age)",
                delay_ms);
@@ -746,11 +751,23 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                         frame_out->width, frame_out->height, source->pts_offset,
                         status_now_ns);
   if (ntp_fresh && absolute_unix_ns > 0) {
+    if (!source->smoothed_input_latency_ns) {
+      source->smoothed_input_latency_ns = observed_latency_ns;
+    } else if (observed_latency_ns >= source->smoothed_input_latency_ns) {
+      source->smoothed_input_latency_ns +=
+          (observed_latency_ns - source->smoothed_input_latency_ns) / 8;
+    } else {
+      source->smoothed_input_latency_ns -=
+          (source->smoothed_input_latency_ns - observed_latency_ns) / 8;
+    }
+    multicam_status_set_sync_latency(source,
+                                     source->smoothed_input_latency_ns);
     uint64_t group_max_latency =
         multicam_status_group_max_latency_ns(status_now_ns);
     schedule_playout_delay(
         source, multicam_status_playout_delay(group_max_latency,
-                                              observed_latency_ns));
+                                              source->smoothed_input_latency_ns),
+        false);
   }
 
   /* Debug log: confirm the timestamp */
@@ -1507,7 +1524,9 @@ static void cleanup_connection(sei_receiver_source_t *source) {
   source->last_video_pts_ns = AV_NOPTS_VALUE;
   source->last_video_output_mono_ns = 0;
   source->video_output_cleared = true;
-  schedule_playout_delay(source, 0);
+  source->smoothed_input_latency_ns = 0;
+  multicam_status_set_sync_latency(source, 0);
+  schedule_playout_delay(source, 0, true);
   multicam_status_set_connection(source, false, NULL, false, 0, 0);
   receiver_log(LOG_INFO, source, "Connection closed and resources freed");
 }
@@ -1726,7 +1745,9 @@ static void *srt_receive_thread(void *data) {
       source->sync_method = SYNC_METHOD_UNKNOWN;
       source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
       source->last_video_pts_ns = AV_NOPTS_VALUE;
-      schedule_playout_delay(source, 0);
+      source->smoothed_input_latency_ns = 0;
+      multicam_status_set_sync_latency(source, 0);
+      schedule_playout_delay(source, 0, true);
       receiver_log(LOG_INFO, source,
                    "Synchronization reset requested; waiting for a fresh absolute timestamp");
     }

@@ -72,6 +72,7 @@ void multicam_status_set_connection(void *key, bool connected,
       slot->value.last_packet_mono_ns = 0;
       slot->value.last_absolute_unix_ns = 0;
       slot->value.observed_latency_ns = 0;
+      slot->value.sync_latency_ns = 0;
       slot->value.rx_bitrate_bps = 0;
       slot->value.rx_bitrate_5s_bps = 0;
       slot->packet_window_bytes = 0;
@@ -256,8 +257,8 @@ uint64_t multicam_status_group_max_latency_ns(uint64_t now_ns)
         (s->sync_method == MULTICAM_SYNC_SEI_STAMPER_NTP ||
          s->sync_method == MULTICAM_SYNC_MOBLIN_TIMECODE) &&
         is_recent(s->last_video_mono_ns, now_ns) &&
-        s->observed_latency_ns > maximum)
-      maximum = s->observed_latency_ns;
+        s->sync_latency_ns > maximum)
+      maximum = s->sync_latency_ns;
   }
   pthread_mutex_unlock(&status_lock);
   return maximum;
@@ -268,6 +269,14 @@ void multicam_status_set_playout_delay(void *key, uint64_t delay_ns)
   pthread_mutex_lock(&status_lock);
   status_slot_t *slot = find_slot(key);
   if (slot) slot->value.playout_delay_ns = delay_ns;
+  pthread_mutex_unlock(&status_lock);
+}
+
+void multicam_status_set_sync_latency(void *key, uint64_t latency_ns)
+{
+  pthread_mutex_lock(&status_lock);
+  status_slot_t *slot = find_slot(key);
+  if (slot) slot->value.sync_latency_ns = latency_ns;
   pthread_mutex_unlock(&status_lock);
 }
 

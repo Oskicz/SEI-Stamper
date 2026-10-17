@@ -22,6 +22,7 @@ int main(void)
   multicam_status_video(&key, MULTICAM_SYNC_MOBLIN_TIMECODE, true,
                         900000000000LL, 550000000ULL, 1920, 1080, 0,
                         2000000000ULL);
+  multicam_status_set_sync_latency(&key, 550000000ULL);
   multicam_source_status_t measured = {0};
   if (multicam_status_snapshot(&measured, 1) != 1 ||
       measured.rx_bitrate_bps != 16000 || measured.rx_bitrate_5s_bps != 16000 || !measured.has_audio ||
