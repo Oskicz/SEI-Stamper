@@ -695,6 +695,42 @@ static void test_ntp_sync_anchor_is_offset_corrected(void) {
 /* ─── Main ─────────────────────────────────────────────────────────────── */
 
 int main(void) {
+  printf("[Stable playout delay calibration]\n");
+  receiver_playout_delay_control_t playout = {0};
+  ASSERT_TRUE(!receiver_playout_delay_control_consider(
+                  &playout, 1600000000ULL, 1000000000ULL,
+                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
+              "start delay candidate without resetting OBS immediately");
+  ASSERT_TRUE(!receiver_playout_delay_control_consider(
+                  &playout, 1620000000ULL, 1500000000ULL,
+                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
+              "ignore small measurement jitter during startup");
+  ASSERT_TRUE(receiver_playout_delay_control_consider(
+                  &playout, 1610000000ULL, 1800000000ULL,
+                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
+              "apply the first stable correction once");
+  ASSERT_EQ(playout.applied_delay_ns, 1610000000ULL,
+            "record the stable applied delay");
+  ASSERT_TRUE(!receiver_playout_delay_control_consider(
+                  &playout, 1630000000ULL, 2000000000ULL,
+                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
+              "do not rebuffer for sub-100ms jitter");
+  ASSERT_TRUE(!receiver_playout_delay_control_consider(
+                  &playout, 1800000000ULL, 3000000000ULL,
+                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
+              "restart stability window for a large delay change");
+  ASSERT_TRUE(!receiver_playout_delay_control_consider(
+                  &playout, 1800000000ULL, 3800000000ULL,
+                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
+              "cool down rebuffering after a large change");
+  ASSERT_TRUE(receiver_playout_delay_control_consider(
+                  &playout, 1800000000ULL, 7000000000ULL,
+                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
+              "apply a persistent large correction after cooldown");
+  receiver_playout_delay_control_reset(&playout);
+  ASSERT_TRUE(!playout.candidate_valid && !playout.has_applied,
+              "reconnect clears the old playout calibration");
+
   printf("SEI-Stamper unit tests\n");
   printf("======================\n\n");
 

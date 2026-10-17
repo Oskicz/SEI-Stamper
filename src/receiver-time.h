@@ -3,6 +3,72 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+typedef struct receiver_playout_delay_control {
+  uint64_t candidate_delay_ns;
+  uint64_t candidate_since_ns;
+  uint64_t applied_delay_ns;
+  uint64_t last_applied_ns;
+  bool candidate_valid;
+  bool has_applied;
+} receiver_playout_delay_control_t;
+
+/* Defer OBS async-delay updates until the requested delay has settled. OBS's
+ * built-in filter flushes its frame queue on every update, so applying jitter
+ * samples directly can repeatedly blank the source. */
+static inline void receiver_playout_delay_control_reset(
+    receiver_playout_delay_control_t *control)
+{
+  if (!control) return;
+  control->candidate_delay_ns = 0;
+  control->candidate_since_ns = 0;
+  control->applied_delay_ns = 0;
+  control->last_applied_ns = 0;
+  control->candidate_valid = false;
+  control->has_applied = false;
+}
+
+static inline bool receiver_playout_delay_control_consider(
+    receiver_playout_delay_control_t *control, uint64_t requested_delay_ns,
+    uint64_t now_ns, uint64_t stability_tolerance_ns,
+    uint64_t settle_window_ns, uint64_t significant_change_ns,
+    uint64_t update_cooldown_ns)
+{
+  if (!control) return false;
+  uint64_t candidate_delta = requested_delay_ns > control->candidate_delay_ns
+      ? requested_delay_ns - control->candidate_delay_ns
+      : control->candidate_delay_ns - requested_delay_ns;
+  if (!control->candidate_valid ||
+      candidate_delta > stability_tolerance_ns ||
+      now_ns < control->candidate_since_ns) {
+    control->candidate_delay_ns = requested_delay_ns;
+    control->candidate_since_ns = now_ns;
+    control->candidate_valid = true;
+    return false;
+  }
+
+  control->candidate_delay_ns = requested_delay_ns;
+  if (now_ns - control->candidate_since_ns < settle_window_ns)
+    return false;
+
+  uint64_t applied_delta = requested_delay_ns > control->applied_delay_ns
+      ? requested_delay_ns - control->applied_delay_ns
+      : control->applied_delay_ns - requested_delay_ns;
+  if (control->has_applied) {
+    if (applied_delta < significant_change_ns ||
+        now_ns < control->last_applied_ns ||
+        now_ns - control->last_applied_ns < update_cooldown_ns)
+      return false;
+  } else if (requested_delay_ns < significant_change_ns) {
+    /* Sub-tolerance skew does not justify flushing the OBS frame queue. */
+    return false;
+  }
+
+  control->applied_delay_ns = requested_delay_ns;
+  control->last_applied_ns = now_ns;
+  control->has_applied = true;
+  return true;
+}
+
 static inline bool receiver_keep_absolute_sync(bool has_absolute_anchor,
                                                bool ntp_enabled,
                                                bool ntp_fresh)

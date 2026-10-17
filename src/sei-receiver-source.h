@@ -9,6 +9,7 @@
 
 #include "ntp-client.h"
 #include "sei-handler.h"
+#include "receiver-time.h"
 #include <libavcodec/avcodec.h> /* AVPacket */
 #include <libavutil/channel_layout.h>
 #include <obs-module.h>
@@ -74,6 +75,7 @@ typedef struct sei_receiver_source {
   bool video_output_cleared;
   obs_source_t *playout_delay_filter;
   uint64_t playout_delay_ns;
+  receiver_playout_delay_control_t playout_delay_control;
   uint64_t smoothed_input_latency_ns;
   bool playout_filter_warning_logged;
   bool playout_delay_cap_warning_logged;

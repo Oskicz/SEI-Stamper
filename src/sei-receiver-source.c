@@ -40,7 +40,10 @@
 #define VIDEO_STALE_TIMEOUT_NS 2000000000ULL
 #define PTS_BACKWARD_RESET_NS 500000000ULL
 #define MAX_SYNC_PLAYOUT_DELAY_NS 2000000000ULL
-#define PLAYOUT_DELAY_UPDATE_THRESHOLD_NS 15000000ULL
+#define PLAYOUT_DELAY_STABILITY_TOLERANCE_NS 30000000ULL
+#define PLAYOUT_DELAY_STABILITY_WINDOW_NS 750000000ULL
+#define PLAYOUT_DELAY_SIGNIFICANT_CHANGE_NS 100000000ULL
+#define PLAYOUT_DELAY_UPDATE_COOLDOWN_NS 5000000000ULL
 
 /*============================================================================
  * Frame buffer management
@@ -383,10 +386,8 @@ static void schedule_playout_delay(sei_receiver_source_t *source,
     }
     delay_ns = MAX_SYNC_PLAYOUT_DELAY_NS;
   }
-  uint64_t difference = delay_ns > source->playout_delay_ns
-                            ? delay_ns - source->playout_delay_ns
-                            : source->playout_delay_ns - delay_ns;
-  if (!force && difference < PLAYOUT_DELAY_UPDATE_THRESHOLD_NS) return;
+  if (force)
+    receiver_playout_delay_control_reset(&source->playout_delay_control);
 
   if (!source->playout_delay_filter) {
     source->playout_delay_ns = 0;
@@ -398,6 +399,24 @@ static void schedule_playout_delay(sei_receiver_source_t *source,
     }
     return;
   }
+  if (!force &&
+      !receiver_playout_delay_control_consider(
+          &source->playout_delay_control, delay_ns, os_gettime_ns(),
+          PLAYOUT_DELAY_STABILITY_TOLERANCE_NS,
+          PLAYOUT_DELAY_STABILITY_WINDOW_NS,
+          PLAYOUT_DELAY_SIGNIFICANT_CHANGE_NS,
+          PLAYOUT_DELAY_UPDATE_COOLDOWN_NS))
+    return;
+
+  uint32_t delay_ms = (uint32_t)((delay_ns + 500000ULL) / 1000000ULL);
+  uint32_t applied_ms =
+      (uint32_t)((source->playout_delay_ns + 500000ULL) / 1000000ULL);
+  if (!force && delay_ms == applied_ms) {
+    source->playout_delay_ns = delay_ns;
+    multicam_status_set_playout_delay(source, delay_ns);
+    return;
+  }
+
   playout_filter_update_t *update = bzalloc(sizeof(*update));
   if (!update) return;
   /* OBS 32.2.2 exports obs_source_get_ref(), not obs_source_addref(). */
@@ -406,8 +425,7 @@ static void schedule_playout_delay(sei_receiver_source_t *source,
     bfree(update);
     return;
   }
-  update->delay_ms = (uint32_t)((delay_ns + 500000ULL) / 1000000ULL);
-  uint32_t delay_ms = update->delay_ms;
+  update->delay_ms = delay_ms;
   obs_queue_task(OBS_TASK_UI, apply_playout_filter_update, update, false);
   source->playout_delay_ns = delay_ns;
   multicam_status_set_playout_delay(source, delay_ns);
