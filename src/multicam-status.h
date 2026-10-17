@@ -17,6 +17,13 @@ typedef enum multicam_status_sync_method {
   MULTICAM_SYNC_MOBLIN_TIMECODE
 } multicam_status_sync_method_t;
 
+typedef enum multicam_sync_quality {
+  MULTICAM_SYNC_QUALITY_EXCELLENT,
+  MULTICAM_SYNC_QUALITY_GOOD,
+  MULTICAM_SYNC_QUALITY_WARNING,
+  MULTICAM_SYNC_QUALITY_BAD
+} multicam_sync_quality_t;
+
 typedef struct multicam_source_status {
   char name[128];
   char codec[16];
@@ -64,8 +71,10 @@ bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
                                    size_t count, uint64_t now_ns,
                                    uint64_t tolerance_ns,
                                    uint64_t *spread_ns);
+multicam_sync_quality_t multicam_status_sync_quality(uint64_t spread_ns);
 
 #ifdef __cplusplus
 }
 #endif
+
 

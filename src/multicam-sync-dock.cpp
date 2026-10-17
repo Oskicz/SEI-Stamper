@@ -103,15 +103,24 @@ void refresh()
     tableWidget->setItem(row, 4, cell(QStringLiteral("%1 ms").arg(s.audio_offset_ms)));
     tableWidget->setItem(row, 5, cell(syncText(s.sync_method), sync_color));
     tableWidget->setItem(row, 6, cell(s.ntp_fresh ? QStringLiteral("Fresh") : QStringLiteral("Stale / waiting"), s.ntp_fresh ? good : warn));
-    tableWidget->setItem(row, 7, cell(!packet_ok ? QStringLiteral("No recent data") : (s.rx_bitrate_bps ? QStringLiteral("%1 Mbps").arg(s.rx_bitrate_bps / 1000000.0, 0, 'f', 2) : QStringLiteral("Measuring")), packet_ok && s.rx_bitrate_bps ? good : warn));
-    tableWidget->setItem(row, 8, cell(s.rx_bitrate_5s_bps ? QStringLiteral("%1 Mbps").arg(s.rx_bitrate_5s_bps / 1000000.0, 0, 'f', 2) : QStringLiteral("Measuring"), packet_ok && s.rx_bitrate_5s_bps ? good : warn));
+    auto *bitrate_1s = cell(!packet_ok ? QStringLiteral("No recent data") : (s.rx_bitrate_bps ? QStringLiteral("%1 Mbps").arg(s.rx_bitrate_bps / 1000000.0, 0, 'f', 2) : QStringLiteral("Measuring")), packet_ok && s.rx_bitrate_bps ? good : warn);
+    bitrate_1s->setToolTip(QStringLiteral("Measured demuxed SRT payload over approximately 1 second; excludes transport overhead."));
+    tableWidget->setItem(row, 7, bitrate_1s);
+    auto *bitrate_5s = cell(s.rx_bitrate_5s_bps ? QStringLiteral("%1 Mbps").arg(s.rx_bitrate_5s_bps / 1000000.0, 0, 'f', 2) : QStringLiteral("Measuring"), packet_ok && s.rx_bitrate_5s_bps ? good : warn);
+    bitrate_5s->setToolTip(QStringLiteral("Measured demuxed SRT payload averaged over approximately 5 seconds; excludes transport overhead."));
+    tableWidget->setItem(row, 8, bitrate_5s);
     tableWidget->setItem(row, 9, cell(s.fps_milli ? QStringLiteral("%1 fps").arg(s.fps_milli / 1000.0, 0, 'f', 1) : QStringLiteral("—")));
     QString delta = QStringLiteral("—");
     QColor delta_color = neutral;
     if (s.last_absolute_unix_ns && absolute_count > 1) {
       const int64_t d = static_cast<int64_t>(s.last_absolute_unix_ns) - static_cast<int64_t>(absolute_sources[0].last_absolute_unix_ns);
       delta = QStringLiteral("%1 ms").arg(d / 1000000.0, 0, 'f', 1);
-      delta_color = spread <= kAlignmentToleranceNs ? good : bad;
+      switch (multicam_status_sync_quality(spread)) {
+      case MULTICAM_SYNC_QUALITY_EXCELLENT: delta_color = QColor(70, 150, 255); break;
+      case MULTICAM_SYNC_QUALITY_GOOD: delta_color = good; break;
+      case MULTICAM_SYNC_QUALITY_WARNING: delta_color = warn; break;
+      case MULTICAM_SYNC_QUALITY_BAD: delta_color = bad; break;
+      }
     }
     tableWidget->setItem(row, 10, cell(video_ok ? QStringLiteral("%1 ms").arg(s.video_offset_ns / 1000000.0, 0, 'f', 1) : QStringLiteral("—")));
     tableWidget->setItem(row, 11, cell(delta, delta_color));
@@ -127,7 +136,7 @@ void refresh()
   bool aligned = absolute_count >= 2 &&
       multicam_status_group_aligned(absolute_sources, absolute_count, now,
                                     kAlignmentToleranceNs, &spread_ns);
-  summaryLabel->setText(QStringLiteral("Receivers: %1 | Preflight: %2 | Absolute group spread: %3 ms")
+  summaryLabel->setText(QStringLiteral("Receivers: %1 | Preflight: %2 | Input timestamp spread: %3 ms")
                             .arg(count).arg(count && ready_count == static_cast<int>(count) && aligned ? QStringLiteral("READY") : QStringLiteral("CHECK"))
                             .arg(absolute_count > 1 ? spread_ns / 1000000.0 : 0.0, 0, 'f', 1));
 }
@@ -143,8 +152,8 @@ void runPreflight()
   bool aligned = count >= 2 && all_ready && multicam_status_group_aligned(
       sources, count, now, kAlignmentToleranceNs, &spread);
   const QString result = aligned
-      ? QStringLiteral("READY: receivers have recent video, expected audio flow, measured RX bitrate, fresh NTP and absolute timestamps. Inter-camera timestamp spread is %1 ms (target ≤16.67 ms). Audio lip-sync still requires playback verification.").arg(spread / 1000000.0, 0, 'f', 1)
-      : QStringLiteral("CHECK: preflight did not pass. Verify every receiver is connected, video/audio are current, RX bitrate is measured, NTP is fresh, metadata is absolute (not PTS fallback), and camera timestamp spread is ≤16.67 ms.");
+      ? QStringLiteral("READY: receivers have recent video, expected audio flow, measured RX bitrate, fresh NTP and absolute timestamps. Inter-camera input timestamp spread is %1 ms (strict preflight target ≤16.67 ms). Audio lip-sync still requires playback verification.").arg(spread / 1000000.0, 0, 'f', 1)
+      : QStringLiteral("CHECK: preflight did not pass. Verify every receiver is connected, video/audio are current, RX bitrate is measured, NTP is fresh, metadata is absolute (not PTS fallback), and input timestamp spread is ≤16.67 ms. This measures newest received frames, not scheduled playout alignment.");
   QMessageBox::information(dockWidget, QStringLiteral("Multicam preflight"), result);
 }
 
@@ -255,4 +264,5 @@ extern "C" void multicam_sync_dock_unload(void)
   tableWidget = nullptr;
   summaryLabel = nullptr;
 }
+
 

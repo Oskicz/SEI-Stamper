@@ -229,3 +229,12 @@ bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
   return all_ready && spread <= tolerance_ns;
 }
 
+multicam_sync_quality_t multicam_status_sync_quality(uint64_t spread_ns)
+{
+  if (spread_ns < 40000000ULL) return MULTICAM_SYNC_QUALITY_EXCELLENT;
+  if (spread_ns < 100000000ULL) return MULTICAM_SYNC_QUALITY_GOOD;
+  if (spread_ns < 250000000ULL) return MULTICAM_SYNC_QUALITY_WARNING;
+  return MULTICAM_SYNC_QUALITY_BAD;
+}
+
+

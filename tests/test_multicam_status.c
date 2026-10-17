@@ -3,6 +3,13 @@
 
 int main(void)
 {
+  if (multicam_status_sync_quality(39999999ULL) != MULTICAM_SYNC_QUALITY_EXCELLENT ||
+      multicam_status_sync_quality(40000000ULL) != MULTICAM_SYNC_QUALITY_GOOD ||
+      multicam_status_sync_quality(99999999ULL) != MULTICAM_SYNC_QUALITY_GOOD ||
+      multicam_status_sync_quality(100000000ULL) != MULTICAM_SYNC_QUALITY_WARNING ||
+      multicam_status_sync_quality(249999999ULL) != MULTICAM_SYNC_QUALITY_WARNING ||
+      multicam_status_sync_quality(250000000ULL) != MULTICAM_SYNC_QUALITY_BAD) return 11;
+
   int key;
   multicam_status_register(&key, "Private source name");
   multicam_status_set_connection(&key, true, "hevc", true, 1920, 1080);
@@ -51,4 +58,5 @@ int main(void)
   puts("Multicam status and conservative preflight tests passed");
   return 0;
 }
+
 
