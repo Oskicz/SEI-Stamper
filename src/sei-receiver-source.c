@@ -400,10 +400,14 @@ static void schedule_playout_delay(sei_receiver_source_t *source,
   }
   playout_filter_update_t *update = bzalloc(sizeof(*update));
   if (!update) return;
-  update->filter = source->playout_delay_filter;
+  /* OBS 32.2.2 exports obs_source_get_ref(), not obs_source_addref(). */
+  update->filter = obs_source_get_ref(source->playout_delay_filter);
+  if (!update->filter) {
+    bfree(update);
+    return;
+  }
   update->delay_ms = (uint32_t)((delay_ns + 500000ULL) / 1000000ULL);
   uint32_t delay_ms = update->delay_ms;
-  obs_source_addref(update->filter);
   obs_queue_task(OBS_TASK_UI, apply_playout_filter_update, update, false);
   source->playout_delay_ns = delay_ns;
   multicam_status_set_playout_delay(source, delay_ns);
