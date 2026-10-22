@@ -814,7 +814,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
         false);
   }
 
-  } else if (source->playout_delay_ns) {
+  if (!ntp_fresh && source->playout_delay_ns) {
     /* Do not retain a delay target after the absolute clock becomes stale. */
     schedule_playout_delay(source, 0, true);
   }
