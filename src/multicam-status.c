@@ -220,9 +220,9 @@ bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
   for (size_t i = 0; i < count; ++i) {
     const multicam_source_status_t *s = &statuses[i];
     if (!multicam_status_source_ready(s, now_ns)) all_ready = false;
+    /* The extra receiver buffer wait changes wall-clock delivery, not the
+     * absolute capture-time difference between camera frames. */
     uint64_t t = s->last_absolute_unix_ns;
-    if (t < s->playout_delay_ns) return false;
-    t -= s->playout_delay_ns;
     if (!t) return false;
     if (t < minimum) minimum = t;
     if (t > maximum) maximum = t;

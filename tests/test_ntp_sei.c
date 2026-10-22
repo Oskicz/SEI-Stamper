@@ -695,6 +695,14 @@ static void test_ntp_sync_anchor_is_offset_corrected(void) {
 /* ─── Main ─────────────────────────────────────────────────────────────── */
 
 int main(void) {
+  printf("[Shared A/V playout timestamps]\n");
+  ASSERT_EQ(receiver_add_playout_latency_ns(10000000000ULL, 1800000000ULL),
+            11800000000ULL, "A/V presentation adds the common group latency");
+  ASSERT_EQ(receiver_add_playout_latency_ns(10000000000ULL, 0),
+            10000000000ULL, "zero group latency preserves the timestamp");
+  ASSERT_TRUE(receiver_add_playout_latency_ns(UINT64_MAX - 3, 10) == UINT64_MAX,
+              "timestamp addition saturates instead of overflowing");
+
   printf("[Stable playout delay calibration]\n");
   receiver_playout_delay_control_t playout = {0};
   ASSERT_TRUE(!receiver_playout_delay_control_consider(

@@ -8,16 +8,25 @@
 #include <QDateTime>
 #include <QColor>
 #include <QAbstractItemView>
+#include <QCheckBox>
+#include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QListWidget>
+#include <QListWidgetItem>
 #include <QLabel>
 #include <QMessageBox>
+#include <QMetaObject>
 #include <QPushButton>
+#include <QSettings>
+#include <QSet>
+#include <QSpinBox>
 #include <QTableWidget>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -25,6 +34,8 @@
 
 #include <cmath>
 #include <algorithm>
+#include <memory>
+#include <thread>
 
 namespace {
 constexpr char kDockId[] = "sei-stamper.multicam-sync-center";
@@ -32,6 +43,172 @@ constexpr uint64_t kAlignmentToleranceNs = 16666667ULL;
 QWidget *dockWidget;
 QTableWidget *tableWidget;
 QLabel *summaryLabel;
+QCheckBox *sceneDelayEnabled;
+QSpinBox *sceneDelayMs;
+QListWidget *sceneDelayScenes;
+QTimer *sceneDelayTimer;
+obs_source_t *lastProgramScene;
+obs_source_t *pendingProgramScene;
+QSet<QString> selectedSceneNames;
+bool loadingSceneSettings;
+
+QString scene_settings_path()
+{
+  char *path = obs_module_config_path("multicam-scene-delay.ini");
+  if (!path) return QString();
+  QString result = QString::fromUtf8(path);
+  bfree(path);
+  return result;
+}
+
+void save_scene_settings()
+{
+  if (loadingSceneSettings || !sceneDelayEnabled || !sceneDelayMs) return;
+  QString path = scene_settings_path();
+  if (path.isEmpty()) return;
+  QDir().mkpath(QFileInfo(path).absolutePath());
+  QSettings settings(path, QSettings::IniFormat);
+  settings.setValue(QStringLiteral("enabled"), sceneDelayEnabled->isChecked());
+  settings.setValue(QStringLiteral("delay_ms"), sceneDelayMs->value());
+  QStringList names;
+  for (const QString &name : selectedSceneNames) names.push_back(name);
+  settings.setValue(QStringLiteral("selected_scenes"), names);
+  settings.sync();
+}
+
+void refresh_scene_list()
+{
+  if (!sceneDelayScenes) return;
+  loadingSceneSettings = true;
+  sceneDelayScenes->clear();
+  obs_frontend_source_list scenes = {};
+  obs_frontend_get_scenes(&scenes);
+  for (size_t i = 0; i < scenes.sources.num; ++i) {
+    obs_source_t *source = scenes.sources.array[i];
+    const QString name = QString::fromUtf8(obs_source_get_name(source));
+    auto *item = new QListWidgetItem(name, sceneDelayScenes);
+    item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+    item->setCheckState(selectedSceneNames.contains(name) ? Qt::Checked : Qt::Unchecked);
+  }
+  obs_frontend_source_list_free(&scenes);
+  loadingSceneSettings = false;
+}
+
+void set_last_program_scene(obs_source_t *scene)
+{
+  obs_source_t *replacement = scene ? obs_source_get_ref(scene) : nullptr;
+  if (lastProgramScene) obs_source_release(lastProgramScene);
+  lastProgramScene = replacement;
+}
+
+bool set_scene_from_worker(obs_source_t *scene)
+{
+  obs_source_t *sceneRef = scene ? obs_source_get_ref(scene) : nullptr;
+  if (!sceneRef) return false;
+  try {
+    std::thread([sceneRef] {
+      /* OBS 32.2.2's public setter waits for the frontend UI thread. Calling it
+       * from this worker avoids blocking/deadlocking the UI event callback. */
+      obs_frontend_set_current_scene(sceneRef);
+      obs_source_release(sceneRef);
+    }).detach();
+  } catch (...) {
+    obs_source_release(sceneRef);
+    return false;
+  }
+  return true;
+}
+
+void cancel_pending_scene()
+{
+  if (sceneDelayTimer) sceneDelayTimer->stop();
+  if (pendingProgramScene) obs_source_release(pendingProgramScene);
+  pendingProgramScene = nullptr;
+}
+
+void apply_pending_scene()
+{
+  if (!pendingProgramScene) return;
+  obs_source_t *target = pendingProgramScene;
+  pendingProgramScene = nullptr;
+  if (lastProgramScene) obs_source_release(lastProgramScene);
+  if (set_scene_from_worker(target)) {
+    if (lastProgramScene) obs_source_release(lastProgramScene);
+    lastProgramScene = obs_source_get_ref(target);
+  }
+  obs_source_release(target);
+}
+
+void handle_program_scene_changed(obs_source_t *current)
+{
+  if (!current || !dockWidget) return;
+  if (!lastProgramScene) {
+    set_last_program_scene(current);
+    return;
+  }
+  if (current == lastProgramScene) return;
+
+  const QString currentName = QString::fromUtf8(obs_source_get_name(current));
+  const bool defer = sceneDelayEnabled && sceneDelayEnabled->isChecked() &&
+                     sceneDelayMs && sceneDelayMs->value() > 0 &&
+                     selectedSceneNames.contains(currentName);
+  if (!defer) {
+    cancel_pending_scene();
+    set_last_program_scene(current);
+    return;
+  }
+
+  cancel_pending_scene();
+  pendingProgramScene = obs_source_get_ref(current);
+  if (!pendingProgramScene) return;
+  /* OBS exposes scene-changed after the requested switch. Restore the previous
+   * program scene immediately, then commit the selected target when the timer
+   * expires. The feature is opt-in and applies only to checked scene names. */
+  if (!set_scene_from_worker(lastProgramScene)) {
+    cancel_pending_scene();
+    return;
+  }
+  sceneDelayTimer->start(sceneDelayMs->value());
+}
+
+void frontend_event(enum obs_frontend_event event, void *opaque)
+{
+  UNUSED_PARAMETER(opaque);
+  QWidget *target = dockWidget;
+  if (!target) return;
+  if (event == OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED ||
+      event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED) {
+    QMetaObject::invokeMethod(target, [] { refresh_scene_list(); },
+                              Qt::QueuedConnection);
+  } else if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING ||
+             event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP) {
+    QMetaObject::invokeMethod(target, [] {
+      cancel_pending_scene();
+      if (lastProgramScene) obs_source_release(lastProgramScene);
+      lastProgramScene = nullptr;
+    }, Qt::QueuedConnection);
+  } else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED) {
+    obs_source_t *current = obs_frontend_get_current_scene();
+    if (!current) return;
+    auto currentRef = std::shared_ptr<obs_source_t>(current, obs_source_release);
+    QMetaObject::invokeMethod(target, [currentRef] {
+      handle_program_scene_changed(currentRef.get());
+    }, Qt::QueuedConnection);
+  }
+}
+
+void load_scene_settings()
+{
+  QString path = scene_settings_path();
+  if (path.isEmpty()) return;
+  QSettings settings(path, QSettings::IniFormat);
+  sceneDelayEnabled->setChecked(settings.value(QStringLiteral("enabled"), false).toBool());
+  sceneDelayMs->setValue(settings.value(QStringLiteral("delay_ms"), 1000).toInt());
+  selectedSceneNames.clear();
+  for (const QString &name :
+       settings.value(QStringLiteral("selected_scenes")).toStringList())
+    selectedSceneNames.insert(name);
+}
 
 QString syncText(multicam_status_sync_method_t method)
 {
@@ -60,13 +237,9 @@ uint64_t group_spread(const multicam_source_status_t *statuses, size_t count)
 {
   uint64_t minimum = UINT64_MAX, maximum = 0;
   for (size_t i = 0; i < count; ++i) {
-    if (!statuses[i].last_absolute_unix_ns ||
-        statuses[i].last_absolute_unix_ns < statuses[i].playout_delay_ns)
-      return 0;
-    const uint64_t playout_time = statuses[i].last_absolute_unix_ns -
-                                  statuses[i].playout_delay_ns;
-    minimum = std::min(minimum, playout_time);
-    maximum = std::max(maximum, playout_time);
+    if (!statuses[i].last_absolute_unix_ns) return 0;
+    minimum = std::min(minimum, statuses[i].last_absolute_unix_ns);
+    maximum = std::max(maximum, statuses[i].last_absolute_unix_ns);
   }
   return count ? maximum - minimum : 0;
 }
@@ -117,9 +290,8 @@ void refresh()
     QString delta = QStringLiteral("—");
     QColor delta_color = neutral;
     if (s.last_absolute_unix_ns && absolute_count > 1) {
-      const int64_t playout_ns = static_cast<int64_t>(s.last_absolute_unix_ns - s.playout_delay_ns);
-      const int64_t reference_ns = static_cast<int64_t>(absolute_sources[0].last_absolute_unix_ns - absolute_sources[0].playout_delay_ns);
-      const int64_t d = playout_ns - reference_ns;
+      const int64_t d = static_cast<int64_t>(s.last_absolute_unix_ns) -
+                        static_cast<int64_t>(absolute_sources[0].last_absolute_unix_ns);
       delta = QStringLiteral("%1 ms").arg(d / 1000000.0, 0, 'f', 1);
       switch (multicam_status_sync_quality(spread)) {
       case MULTICAM_SYNC_QUALITY_EXCELLENT: delta_color = QColor(70, 150, 255); break;
@@ -193,7 +365,7 @@ void exportReport()
     item.insert(QStringLiteral("video_pts_offset_ns"), static_cast<qint64>(s.video_offset_ns));
     item.insert(QStringLiteral("observed_input_latency_ms"),
                 s.observed_latency_ns / 1000000.0);
-    item.insert(QStringLiteral("scheduled_playout_delay_ms"),
+    item.insert(QStringLiteral("receiver_buffer_wait_ms"),
                 s.playout_delay_ns / 1000000.0);
     item.insert(QStringLiteral("fps"), s.fps_milli / 1000.0);
     item.insert(QStringLiteral("ready"), ready);
@@ -233,6 +405,48 @@ extern "C" void multicam_sync_dock_load(void)
   auto *layout = new QVBoxLayout(widget);
   summaryLabel = new QLabel(QStringLiteral("Waiting for SEI Receiver sources…"), widget);
   layout->addWidget(summaryLabel);
+
+  auto *sceneDelayRow = new QHBoxLayout();
+  sceneDelayEnabled = new QCheckBox(QStringLiteral("Delay selected scene changes"), widget);
+  sceneDelayMs = new QSpinBox(widget);
+  sceneDelayMs->setRange(0, 30000);
+  sceneDelayMs->setSingleStep(100);
+  sceneDelayMs->setSuffix(QStringLiteral(" ms"));
+  sceneDelayScenes = new QListWidget(widget);
+  sceneDelayScenes->setMaximumHeight(110);
+  load_scene_settings();
+  sceneDelayRow->addWidget(sceneDelayEnabled);
+  sceneDelayRow->addWidget(new QLabel(QStringLiteral("Delay:"), widget));
+  sceneDelayRow->addWidget(sceneDelayMs);
+  sceneDelayRow->addStretch(1);
+  layout->addLayout(sceneDelayRow);
+  layout->addWidget(new QLabel(QStringLiteral("Scenes affected when delay is enabled:"), widget));
+  layout->addWidget(sceneDelayScenes);
+  QObject::connect(sceneDelayEnabled, &QCheckBox::toggled, widget,
+                   [](bool enabled) {
+    if (!enabled) apply_pending_scene();
+    save_scene_settings();
+  });
+  QObject::connect(sceneDelayMs, qOverload<int>(&QSpinBox::valueChanged), widget,
+                   [](int delay_ms) {
+    if (pendingProgramScene && sceneDelayTimer) {
+      if (delay_ms <= 0)
+        apply_pending_scene();
+      else
+        sceneDelayTimer->start(delay_ms);
+    }
+    save_scene_settings();
+  });
+  QObject::connect(sceneDelayScenes, &QListWidget::itemChanged, widget,
+                   [](QListWidgetItem *item) {
+    if (item->checkState() == Qt::Checked)
+      selectedSceneNames.insert(item->text());
+    else
+      selectedSceneNames.remove(item->text());
+    save_scene_settings();
+  });
+  refresh_scene_list();
+
   tableWidget = new QTableWidget(0, 13, widget);
   tableWidget->setHorizontalHeaderLabels({QStringLiteral("Source"), QStringLiteral("Link"),
       QStringLiteral("Video"), QStringLiteral("Audio"), QStringLiteral("Audio offset"), QStringLiteral("Sync source"),
@@ -254,19 +468,33 @@ extern "C" void multicam_sync_dock_load(void)
   layout->addLayout(buttons);
   QObject::connect(preflight, &QPushButton::clicked, widget, runPreflight);
   QObject::connect(report, &QPushButton::clicked, widget, exportReport);
+  sceneDelayTimer = new QTimer(widget);
+  sceneDelayTimer->setSingleShot(true);
+  QObject::connect(sceneDelayTimer, &QTimer::timeout, widget, apply_pending_scene);
   auto *timer = new QTimer(widget);
   QObject::connect(timer, &QTimer::timeout, widget, refresh);
   timer->start(500);
   refresh();
-  if (obs_frontend_add_dock_by_id(kDockId, "Multicam Sync Center", widget))
+  if (obs_frontend_add_dock_by_id(kDockId, "Multicam Sync Center", widget)) {
     dockWidget = widget;
-  else
+    lastProgramScene = obs_frontend_get_current_scene();
+    obs_frontend_add_event_callback(frontend_event, nullptr);
+  } else {
     delete widget;
+  }
 }
 
 extern "C" void multicam_sync_dock_unload(void)
 {
   if (!dockWidget) return;
+  obs_frontend_remove_event_callback(frontend_event, nullptr);
+  cancel_pending_scene();
+  if (lastProgramScene) obs_source_release(lastProgramScene);
+  lastProgramScene = nullptr;
+  sceneDelayTimer = nullptr;
+  sceneDelayEnabled = nullptr;
+  sceneDelayMs = nullptr;
+  sceneDelayScenes = nullptr;
   obs_frontend_remove_dock(kDockId);
   dockWidget = nullptr;
   tableWidget = nullptr;

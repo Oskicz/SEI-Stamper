@@ -3,6 +3,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+static inline uint64_t receiver_add_playout_latency_ns(uint64_t timestamp_ns,
+                                                        uint64_t latency_ns)
+{
+  return latency_ns > UINT64_MAX - timestamp_ns ? UINT64_MAX
+                                                 : timestamp_ns + latency_ns;
+}
+
 typedef struct receiver_playout_delay_control {
   uint64_t candidate_delay_ns;
   uint64_t candidate_since_ns;

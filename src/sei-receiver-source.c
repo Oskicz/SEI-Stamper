@@ -399,9 +399,23 @@ static void schedule_playout_delay(sei_receiver_source_t *source,
     }
     return;
   }
-  if (!force &&
+  receiver_playout_delay_control_t previous_control =
+      source->playout_delay_control;
+  uint64_t now_ns = os_gettime_ns();
+  bool initial_buffer = !force &&
+      !source->playout_delay_control.has_applied &&
+      delay_ns >= PLAYOUT_DELAY_SIGNIFICANT_CHANGE_NS;
+  if (initial_buffer) {
+    /* Install the initial buffer before pushing far-future frames into OBS's
+     * 30-frame async queue. Later recalibrations remain stability-gated. */
+    source->playout_delay_control.applied_delay_ns = delay_ns;
+    source->playout_delay_control.last_applied_ns = now_ns;
+    source->playout_delay_control.has_applied = true;
+    source->playout_delay_control.candidate_valid = false;
+  }
+  if (!force && !initial_buffer &&
       !receiver_playout_delay_control_consider(
-          &source->playout_delay_control, delay_ns, os_gettime_ns(),
+          &source->playout_delay_control, delay_ns, now_ns,
           PLAYOUT_DELAY_STABILITY_TOLERANCE_NS,
           PLAYOUT_DELAY_STABILITY_WINDOW_NS,
           PLAYOUT_DELAY_SIGNIFICANT_CHANGE_NS,
@@ -418,11 +432,15 @@ static void schedule_playout_delay(sei_receiver_source_t *source,
   }
 
   playout_filter_update_t *update = bzalloc(sizeof(*update));
-  if (!update) return;
+  if (!update) {
+    source->playout_delay_control = previous_control;
+    return;
+  }
   /* OBS 32.2.2 exports obs_source_get_ref(), not obs_source_addref(). */
   update->filter = obs_source_get_ref(source->playout_delay_filter);
   if (!update->filter) {
     bfree(update);
+    source->playout_delay_control = previous_control;
     return;
   }
   update->delay_ms = delay_ms;
@@ -724,7 +742,9 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   /* Calculate correct Sync Timestamp */
   if (frame_out->has_ntp)
     source->sync_method = frame_out->timestamp_source;
-  obs_frame.timestamp = calculate_display_time(source, frame_out);
+  int64_t capture_display_time = calculate_display_time(source, frame_out);
+  obs_frame.timestamp = capture_display_time > 0
+                            ? (uint64_t)capture_display_time : 0;
 
   int64_t absolute_unix_ns = 0;
   int64_t current_unix_ns = 0;
@@ -772,6 +792,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                         observed_latency_ns,
                         frame_out->width, frame_out->height, source->pts_offset,
                         status_now_ns);
+  uint64_t group_playout_latency_ns = 0;
   if (ntp_fresh && absolute_unix_ns > 0) {
     if (!source->smoothed_input_latency_ns) {
       source->smoothed_input_latency_ns = observed_latency_ns;
@@ -786,11 +807,19 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                                      source->smoothed_input_latency_ns);
     uint64_t group_max_latency =
         multicam_status_group_max_latency_ns(status_now_ns);
+    group_playout_latency_ns = group_max_latency;
     schedule_playout_delay(
         source, multicam_status_playout_delay(group_max_latency,
                                               source->smoothed_input_latency_ns),
         false);
   }
+
+  } else if (source->playout_delay_ns) {
+    /* Do not retain a delay target after the absolute clock becomes stale. */
+    schedule_playout_delay(source, 0, true);
+  }
+  obs_frame.timestamp = receiver_add_playout_latency_ns(
+      obs_frame.timestamp, group_playout_latency_ns);
 
   /* Debug log: confirm the timestamp */
   receiver_log(
@@ -1070,8 +1099,25 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
     pthread_mutex_lock(&source->audio_settings_lock);
     int64_t audio_offset_ns = source->audio_offset_ns;
     pthread_mutex_unlock(&source->audio_settings_lock);
+    int64_t capture_audio_time = get_sync_timestamp(source, pts_ns);
+    uint64_t scheduled_audio_time = receiver_audio_timestamp_with_offset(
+        capture_audio_time, 0);
+    bool absolute_audio_clock =
+        source->absolute_sync_method != SYNC_METHOD_UNKNOWN &&
+        source->ntp_enabled && !ntp_client_needs_resync(
+            &source->ntp_client,
+            receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
+    if (absolute_audio_clock) {
+      uint64_t group_latency =
+          multicam_status_group_max_latency_ns(os_gettime_ns());
+      scheduled_audio_time = receiver_add_playout_latency_ns(
+          scheduled_audio_time, group_latency);
+    }
+    int64_t scheduled_audio_time_signed =
+        scheduled_audio_time > (uint64_t)INT64_MAX
+            ? INT64_MAX : (int64_t)scheduled_audio_time;
     audio.timestamp = receiver_audio_timestamp_with_offset(
-        get_sync_timestamp(source, pts_ns), audio_offset_ns);
+        scheduled_audio_time_signed, audio_offset_ns);
 
     obs_source_output_audio(source->context, &audio);
     multicam_status_audio(source, os_gettime_ns());
