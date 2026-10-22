@@ -73,6 +73,12 @@ bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
                                    size_t count, uint64_t now_ns,
                                    uint64_t tolerance_ns,
                                    uint64_t *spread_ns);
+uint64_t multicam_status_presentation_time_ns(
+    const multicam_source_status_t *status);
+uint64_t multicam_status_selected_scene_delay_ns(
+    const multicam_source_status_t *statuses, size_t status_count,
+    const char *const *selected_source_names, size_t selected_source_count,
+    uint64_t now_ns);
 multicam_sync_quality_t multicam_status_sync_quality(uint64_t spread_ns);
 uint64_t multicam_status_playout_delay(uint64_t group_max_latency_ns,
                                        uint64_t source_latency_ns);
@@ -83,5 +89,4 @@ void multicam_status_set_sync_latency(void *key, uint64_t latency_ns);
 #ifdef __cplusplus
 }
 #endif
-
 

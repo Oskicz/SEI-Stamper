@@ -8,8 +8,8 @@
 #pragma once
 
 #include "ntp-client.h"
-#include "sei-handler.h"
 #include "receiver-time.h"
+#include "sei-handler.h"
 #include <libavcodec/avcodec.h> /* AVPacket */
 #include <libavutil/channel_layout.h>
 #include <obs-module.h>
@@ -74,9 +74,11 @@ typedef struct sei_receiver_source {
   uint64_t last_video_output_mono_ns;
   bool video_output_cleared;
   obs_source_t *playout_delay_filter;
+  pthread_mutex_t playout_filter_lock;
+  bool playout_filter_lock_initialized;
   uint64_t playout_delay_ns;
-  receiver_playout_delay_control_t playout_delay_control;
   uint64_t smoothed_input_latency_ns;
+  receiver_playout_delay_control_t playout_delay_control;
   bool playout_filter_warning_logged;
   bool playout_delay_cap_warning_logged;
 
@@ -161,6 +163,10 @@ typedef struct sei_receiver_source {
 
 } sei_receiver_source_t;
 
+/* Remove filters left by older plugin builds and recreate one managed filter
+ * for each loaded receiver. Call on the OBS UI thread after collection load. */
+void sei_receiver_cleanup_playout_filters(void);
+
 /* Source plugin info */
 extern struct obs_source_info sei_receiver_source_info;
 
@@ -211,5 +217,4 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
 #ifdef __cplusplus
 }
 #endif
-
 

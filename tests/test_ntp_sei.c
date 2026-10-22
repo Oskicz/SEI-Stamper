@@ -692,53 +692,34 @@ static void test_ntp_sync_anchor_is_offset_corrected(void) {
               "anchor survives the NTP timestamp round-trip");
 }
 
+static void test_playout_timestamps_use_common_latency(void) {
+  printf("  scheduled output timestamps add the common group latency...\n");
+  ASSERT_TRUE(receiver_add_playout_latency_ns(10000000000ULL, 1800000000ULL) ==
+              11800000000ULL, "shared output time includes measured group latency");
+  ASSERT_TRUE(receiver_add_playout_latency_ns(10000000000ULL, 0) ==
+              10000000000ULL, "zero group latency preserves the input timestamp");
+  ASSERT_TRUE(receiver_add_playout_latency_ns(UINT64_MAX - 3, 10) == UINT64_MAX,
+              "timestamp addition saturates instead of wrapping around");
+}
+
+static void test_playout_delay_updates_are_stable(void) {
+  printf("  playout delay ignores jitter and waits for stable corrections...\n");
+  receiver_playout_delay_control_t control = {0};
+  uint64_t applied = UINT64_MAX;
+  ASSERT_TRUE(receiver_playout_delay_consider(&control, 900000000ULL, 1000000000ULL, &applied), "initial target is applied immediately");
+  ASSERT_TRUE(applied == 900000000ULL, "initial target becomes active");
+  ASSERT_TRUE(!receiver_playout_delay_consider(&control, 950000000ULL, 2000000000ULL, &applied), "small jitter is not applied");
+  ASSERT_TRUE(!receiver_playout_delay_consider(&control, 970000000ULL, 2300000000ULL, &applied), "jitter remains below correction threshold");
+  ASSERT_TRUE(!receiver_playout_delay_consider(&control, 960000000ULL, 2600000000ULL, &applied), "jitter does not reset the active delay");
+  ASSERT_TRUE(applied == 900000000ULL, "jitter retains the applied delay");
+  ASSERT_TRUE(!receiver_playout_delay_consider(&control, 1300000000ULL, 4000000000ULL, &applied), "large correction starts a stability window");
+  ASSERT_TRUE(receiver_playout_delay_consider(&control, 1310000000ULL, 4800000000ULL, &applied), "stable correction applies after settle and cooldown");
+  ASSERT_TRUE(applied == 1310000000ULL, "stable target becomes active");
+}
+
 /* ─── Main ─────────────────────────────────────────────────────────────── */
 
 int main(void) {
-  printf("[Shared A/V playout timestamps]\n");
-  ASSERT_EQ(receiver_add_playout_latency_ns(10000000000ULL, 1800000000ULL),
-            11800000000ULL, "A/V presentation adds the common group latency");
-  ASSERT_EQ(receiver_add_playout_latency_ns(10000000000ULL, 0),
-            10000000000ULL, "zero group latency preserves the timestamp");
-  ASSERT_TRUE(receiver_add_playout_latency_ns(UINT64_MAX - 3, 10) == UINT64_MAX,
-              "timestamp addition saturates instead of overflowing");
-
-  printf("[Stable playout delay calibration]\n");
-  receiver_playout_delay_control_t playout = {0};
-  ASSERT_TRUE(!receiver_playout_delay_control_consider(
-                  &playout, 1600000000ULL, 1000000000ULL,
-                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
-              "start delay candidate without resetting OBS immediately");
-  ASSERT_TRUE(!receiver_playout_delay_control_consider(
-                  &playout, 1620000000ULL, 1500000000ULL,
-                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
-              "ignore small measurement jitter during startup");
-  ASSERT_TRUE(receiver_playout_delay_control_consider(
-                  &playout, 1610000000ULL, 1800000000ULL,
-                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
-              "apply the first stable correction once");
-  ASSERT_EQ(playout.applied_delay_ns, 1610000000ULL,
-            "record the stable applied delay");
-  ASSERT_TRUE(!receiver_playout_delay_control_consider(
-                  &playout, 1630000000ULL, 2000000000ULL,
-                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
-              "do not rebuffer for sub-100ms jitter");
-  ASSERT_TRUE(!receiver_playout_delay_control_consider(
-                  &playout, 1800000000ULL, 3000000000ULL,
-                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
-              "restart stability window for a large delay change");
-  ASSERT_TRUE(!receiver_playout_delay_control_consider(
-                  &playout, 1800000000ULL, 3800000000ULL,
-                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
-              "cool down rebuffering after a large change");
-  ASSERT_TRUE(receiver_playout_delay_control_consider(
-                  &playout, 1800000000ULL, 7000000000ULL,
-                  30000000ULL, 750000000ULL, 100000000ULL, 5000000000ULL),
-              "apply a persistent large correction after cooldown");
-  receiver_playout_delay_control_reset(&playout);
-  ASSERT_TRUE(!playout.candidate_valid && !playout.has_applied,
-              "reconnect clears the old playout calibration");
-
   printf("SEI-Stamper unit tests\n");
   printf("======================\n\n");
 
@@ -802,6 +783,8 @@ int main(void) {
   test_ntp_fractional_precision();
   test_ntp_conversion_known_values();
   test_ntp_sync_anchor_is_offset_corrected();
+  test_playout_timestamps_use_common_latency();
+  test_playout_delay_updates_are_stable();
   test_ntp_sanity_check();
 
   printf("\n[SEI payload]\n");

@@ -209,6 +209,41 @@ bool multicam_status_source_ready(const multicam_source_status_t *s,
   return !s->has_audio || is_recent(s->last_audio_mono_ns, now_ns);
 }
 
+uint64_t multicam_status_presentation_time_ns(
+    const multicam_source_status_t *status)
+{
+  if (!status || !status->last_absolute_unix_ns) return 0;
+  uint64_t capture_ns = status->last_absolute_unix_ns;
+  return status->playout_delay_ns > UINT64_MAX - capture_ns
+             ? UINT64_MAX : capture_ns + status->playout_delay_ns;
+}
+
+uint64_t multicam_status_selected_scene_delay_ns(
+    const multicam_source_status_t *statuses, size_t status_count,
+    const char *const *selected_source_names, size_t selected_source_count,
+    uint64_t now_ns)
+{
+  if (!statuses || !selected_source_names || !selected_source_count) return 0;
+  uint64_t maximum_latency_ns = 0;
+  for (size_t i = 0; i < status_count; ++i) {
+    const multicam_source_status_t *s = &statuses[i];
+    if (!s->connected || !s->ntp_fresh || !is_recent(s->last_video_mono_ns, now_ns) ||
+        !s->sync_latency_ns ||
+        (s->sync_method != MULTICAM_SYNC_SEI_STAMPER_NTP &&
+         s->sync_method != MULTICAM_SYNC_MOBLIN_TIMECODE))
+      continue;
+    for (size_t j = 0; j < selected_source_count; ++j) {
+      if (selected_source_names[j] &&
+          strcmp(s->name, selected_source_names[j]) == 0) {
+        if (s->sync_latency_ns > maximum_latency_ns)
+          maximum_latency_ns = s->sync_latency_ns;
+        break;
+      }
+    }
+  }
+  return maximum_latency_ns;
+}
+
 bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
                                    size_t count, uint64_t now_ns,
                                    uint64_t tolerance_ns,
@@ -220,9 +255,10 @@ bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
   for (size_t i = 0; i < count; ++i) {
     const multicam_source_status_t *s = &statuses[i];
     if (!multicam_status_source_ready(s, now_ns)) all_ready = false;
-    /* The extra receiver buffer wait changes wall-clock delivery, not the
-     * absolute capture-time difference between camera frames. */
-    uint64_t t = s->last_absolute_unix_ns;
+    /* last_absolute_unix_ns is the capture clock. The per-source async filter
+     * physically holds video by playout_delay_ns, so compare scheduled output
+     * times rather than raw capture times. */
+    uint64_t t = multicam_status_presentation_time_ns(s);
     if (!t) return false;
     if (t < minimum) minimum = t;
     if (t > maximum) maximum = t;
@@ -279,5 +315,4 @@ void multicam_status_set_sync_latency(void *key, uint64_t latency_ns)
   if (slot) slot->value.sync_latency_ns = latency_ns;
   pthread_mutex_unlock(&status_lock);
 }
-
 
