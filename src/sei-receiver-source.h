@@ -120,6 +120,13 @@ typedef struct sei_receiver_source {
   /* PTS sync */
   int64_t pts_offset;  /* PTS to SystemTime offset */
   bool has_pts_offset; /* whether the offset has been computed */
+  int64_t audio_pts_offset_ns; /* independent audio PTS epoch mapped to video */
+  bool audio_pts_offset_valid;
+  int64_t last_audio_pts_ns;
+  uint64_t last_audio_pts_mono_ns;
+  int64_t last_video_capture_time_ns;
+  uint64_t last_video_capture_mono_ns;
+  uint64_t audio_waiting_for_anchor_since_ns;
   sync_method_t sync_method; /* actual timestamp source in use */
   sync_method_t absolute_sync_method; /* last validated absolute timestamp source */
 

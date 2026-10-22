@@ -692,6 +692,29 @@ static void test_ntp_sync_anchor_is_offset_corrected(void) {
               "anchor survives the NTP timestamp round-trip");
 }
 
+static void test_audio_pts_epoch_is_anchored_to_video_capture_clock(void) {
+  printf("  independent audio PTS epoch is aligned to video capture clock...\\n");
+  int64_t audio_offset_ns = 0;
+  ASSERT_TRUE(receiver_audio_pts_anchor_offset_ns(
+                  100000000000LL, 101000000000ULL, 2200000000LL,
+                  100000000000ULL, &audio_offset_ns),
+              "audio PTS observed before video is projected to its clock");
+  ASSERT_TRUE(audio_offset_ns == 96800000000LL,
+              "independent audio PTS origin is removed at the anchor");
+  int64_t mapped_audio_ns = 0;
+  ASSERT_TRUE(receiver_add_signed_ns(3200000000LL, audio_offset_ns,
+                                     &mapped_audio_ns),
+              "audio PTS maps safely into the video clock");
+  ASSERT_TRUE(mapped_audio_ns == 100000000000LL,
+              "audio progression remains on the anchored capture timeline");
+  ASSERT_TRUE(receiver_smooth_audio_pts_offset_ns(
+                  audio_offset_ns, audio_offset_ns + 160000000LL) ==
+                  audio_offset_ns + 10000000LL,
+              "subsequent A/V corrections are slewed instead of jumped");
+  ASSERT_TRUE(!receiver_add_signed_ns(INT64_MAX, 1, &mapped_audio_ns),
+              "signed timestamp mapping rejects overflow");
+}
+
 static void test_playout_timestamps_use_common_latency(void) {
   printf("  scheduled output timestamps add the common group latency...\n");
   ASSERT_TRUE(receiver_add_playout_latency_ns(10000000000ULL, 1800000000ULL) ==
@@ -783,6 +806,7 @@ int main(void) {
   test_ntp_fractional_precision();
   test_ntp_conversion_known_values();
   test_ntp_sync_anchor_is_offset_corrected();
+  test_audio_pts_epoch_is_anchored_to_video_capture_clock();
   test_playout_timestamps_use_common_latency();
   test_playout_delay_updates_are_stable();
   test_ntp_sanity_check();

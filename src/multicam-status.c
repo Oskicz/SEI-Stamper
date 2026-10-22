@@ -214,8 +214,10 @@ uint64_t multicam_status_presentation_time_ns(
 {
   if (!status || !status->last_absolute_unix_ns) return 0;
   uint64_t capture_ns = status->last_absolute_unix_ns;
-  return status->playout_delay_ns > UINT64_MAX - capture_ns
-             ? UINT64_MAX : capture_ns + status->playout_delay_ns;
+  /* The filter outputs an older buffered frame: account for its hold time
+   * when estimating the capture instant currently on screen. */
+  return capture_ns > status->playout_delay_ns
+             ? capture_ns - status->playout_delay_ns : 0;
 }
 
 uint64_t multicam_status_selected_scene_delay_ns(
@@ -255,9 +257,9 @@ bool multicam_status_group_aligned(const multicam_source_status_t *statuses,
   for (size_t i = 0; i < count; ++i) {
     const multicam_source_status_t *s = &statuses[i];
     if (!multicam_status_source_ready(s, now_ns)) all_ready = false;
-    /* last_absolute_unix_ns is the capture clock. The per-source async filter
-     * physically holds video by playout_delay_ns, so compare scheduled output
-     * times rather than raw capture times. */
+    /* last_absolute_unix_ns is the newest decoded capture clock. The per-source
+     * async filter holds newer frames and currently shows content captured
+     * playout_delay_ns earlier. */
     uint64_t t = multicam_status_presentation_time_ns(s);
     if (!t) return false;
     if (t < minimum) minimum = t;

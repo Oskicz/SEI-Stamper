@@ -24,6 +24,60 @@ static inline uint64_t receiver_add_playout_latency_ns(uint64_t timestamp_ns,
                                                  : timestamp_ns + latency_ns;
 }
 
+/* Map an independent audio-stream PTS epoch onto the video capture clock.
+ * Monotonic observation times compensate for packets decoded at different
+ * points in the same live stream. */
+static inline bool receiver_audio_pts_anchor_offset_ns(
+    int64_t video_capture_ns, uint64_t video_observed_mono_ns,
+    int64_t audio_pts_ns, uint64_t audio_observed_mono_ns,
+    int64_t *audio_offset_ns)
+{
+  if (!audio_offset_ns) return false;
+  int64_t projected_video_capture_ns = video_capture_ns;
+  if (audio_observed_mono_ns >= video_observed_mono_ns) {
+    uint64_t elapsed = audio_observed_mono_ns - video_observed_mono_ns;
+    if (elapsed > (uint64_t)INT64_MAX ||
+        projected_video_capture_ns > INT64_MAX - (int64_t)elapsed)
+      return false;
+    projected_video_capture_ns += (int64_t)elapsed;
+  } else {
+    uint64_t elapsed = video_observed_mono_ns - audio_observed_mono_ns;
+    if (elapsed > (uint64_t)INT64_MAX ||
+        projected_video_capture_ns < INT64_MIN + (int64_t)elapsed)
+      return false;
+    projected_video_capture_ns -= (int64_t)elapsed;
+  }
+  if ((audio_pts_ns < 0 &&
+       projected_video_capture_ns > INT64_MAX + audio_pts_ns) ||
+      (audio_pts_ns > 0 &&
+       projected_video_capture_ns < INT64_MIN + audio_pts_ns))
+    return false;
+  *audio_offset_ns = projected_video_capture_ns - audio_pts_ns;
+  return true;
+}
+
+static inline bool receiver_add_signed_ns(int64_t timestamp_ns,
+                                           int64_t offset_ns,
+                                           int64_t *result_ns)
+{
+  if (!result_ns ||
+      (offset_ns > 0 && timestamp_ns > INT64_MAX - offset_ns) ||
+      (offset_ns < 0 && timestamp_ns < INT64_MIN - offset_ns))
+    return false;
+  *result_ns = timestamp_ns + offset_ns;
+  return true;
+}
+
+static inline int64_t receiver_smooth_audio_pts_offset_ns(int64_t current_ns,
+                                                           int64_t target_ns)
+{
+  long double next = (long double)current_ns +
+                     ((long double)target_ns - (long double)current_ns) / 16.0L;
+  if (next > (long double)INT64_MAX) return INT64_MAX;
+  if (next < (long double)INT64_MIN) return INT64_MIN;
+  return (int64_t)(next >= 0 ? next + 0.5L : next - 0.5L);
+}
+
 static inline void receiver_playout_delay_reset(
     receiver_playout_delay_control_t *control)
 {

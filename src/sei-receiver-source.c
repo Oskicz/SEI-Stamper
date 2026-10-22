@@ -708,6 +708,13 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                  "Video PTS moved backwards; resetting sync anchor");
     source->has_pts_offset = false;
     source->pts_offset = 0;
+    source->audio_pts_offset_ns = 0;
+    source->audio_pts_offset_valid = false;
+    source->last_audio_pts_ns = 0;
+    source->last_audio_pts_mono_ns = 0;
+    source->last_video_capture_time_ns = 0;
+    source->last_video_capture_mono_ns = 0;
+    source->audio_waiting_for_anchor_since_ns = 0;
     source->sync_method = SYNC_METHOD_UNKNOWN;
     source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
   }
@@ -906,6 +913,32 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                         status_now_ns);
   uint64_t group_playout_latency_ns = 0;
   if (ntp_fresh && absolute_unix_ns > 0) {
+    source->last_video_capture_time_ns = capture_display_time;
+    source->last_video_capture_mono_ns = status_now_ns;
+    if (source->last_audio_pts_mono_ns &&
+        status_now_ns >= source->last_audio_pts_mono_ns &&
+        status_now_ns - source->last_audio_pts_mono_ns <= 500000000ULL) {
+      int64_t audio_offset_ns;
+      if (receiver_audio_pts_anchor_offset_ns(
+              capture_display_time, status_now_ns, source->last_audio_pts_ns,
+              source->last_audio_pts_mono_ns, &audio_offset_ns)) {
+        bool first_audio_anchor = !source->audio_pts_offset_valid;
+        source->audio_pts_offset_ns = first_audio_anchor
+            ? audio_offset_ns
+            : receiver_smooth_audio_pts_offset_ns(
+                  source->audio_pts_offset_ns, audio_offset_ns);
+        source->audio_pts_offset_valid = true;
+        source->audio_waiting_for_anchor_since_ns = 0;
+        if (first_audio_anchor) {
+          double relative_offset_ms =
+              ((double)source->audio_pts_offset_ns -
+               (double)source->pts_offset) / 1000000.0;
+          receiver_log(LOG_INFO, source,
+                       "Audio PTS epoch anchored to video capture clock (relative correction: %.3f ms)",
+                       relative_offset_ms);
+        }
+      }
+    }
     if (!source->smoothed_input_latency_ns) {
       source->smoothed_input_latency_ns = observed_latency_ns;
     } else if (observed_latency_ns >= source->smoothed_input_latency_ns) {
@@ -1211,11 +1244,49 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
                                       (int64_t)os_gettime_ns();
     }
 
+    uint64_t audio_now_ns = os_gettime_ns();
+    if (pts != AV_NOPTS_VALUE) {
+      if (source->last_audio_pts_mono_ns &&
+          receiver_pts_has_backward_reset(source->last_audio_pts_ns, pts_ns,
+                                          PTS_BACKWARD_RESET_NS)) {
+        receiver_log(LOG_WARNING, source,
+                     "Audio PTS moved backwards; recalibrating audio clock to video");
+        source->audio_pts_offset_valid = false;
+      }
+      source->last_audio_pts_ns = pts_ns;
+      source->last_audio_pts_mono_ns = audio_now_ns;
+    }
+
+    /* Avoid initializing OBS audio from the local clock before the first video
+     * NTP anchor arrives. Non-NTP streams fall back after a short startup wait. */
+    if (source->ntp_enabled && !source->audio_pts_offset_valid &&
+        source->sync_method == SYNC_METHOD_UNKNOWN) {
+      if (!source->audio_waiting_for_anchor_since_ns)
+        source->audio_waiting_for_anchor_since_ns = audio_now_ns;
+      if (audio_now_ns >= source->audio_waiting_for_anchor_since_ns &&
+          audio_now_ns - source->audio_waiting_for_anchor_since_ns < 500000000ULL) {
+        multicam_status_audio(source, audio_now_ns);
+        av_freep(&converted[0]);
+        av_freep(&converted);
+        av_frame_unref(frame);
+        continue;
+      }
+    }
+
     /* Use the shared timestamp sync */
     pthread_mutex_lock(&source->audio_settings_lock);
     int64_t audio_offset_ns = source->audio_offset_ns;
     pthread_mutex_unlock(&source->audio_settings_lock);
-    int64_t capture_audio_time = get_sync_timestamp(source, pts_ns);
+    int64_t capture_audio_time;
+    if (pts != AV_NOPTS_VALUE && source->audio_pts_offset_valid &&
+        !receiver_add_signed_ns(pts_ns, source->audio_pts_offset_ns,
+                                &capture_audio_time)) {
+      capture_audio_time = get_sync_timestamp(source, pts_ns);
+    } else if (pts != AV_NOPTS_VALUE && source->audio_pts_offset_valid) {
+      /* Independent audio PTS origin is mapped to the NTP video capture clock. */
+    } else {
+      capture_audio_time = get_sync_timestamp(source, pts_ns);
+    }
     uint64_t scheduled_audio_time = receiver_audio_timestamp_with_offset(
         capture_audio_time, 0);
     bool absolute_audio_clock = source->absolute_sync_method != SYNC_METHOD_UNKNOWN &&
@@ -1235,7 +1306,7 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
         scheduled_audio_time_signed, audio_offset_ns);
 
     obs_source_output_audio(source->context, &audio);
-    multicam_status_audio(source, os_gettime_ns());
+    multicam_status_audio(source, audio_now_ns);
     av_freep(&converted[0]);
     av_freep(&converted);
     av_frame_unref(frame);
@@ -1714,6 +1785,13 @@ static void cleanup_connection(sei_receiver_source_t *source) {
   source->last_video_output_mono_ns = 0;
   source->video_output_cleared = true;
   source->smoothed_input_latency_ns = 0;
+  source->audio_pts_offset_ns = 0;
+  source->audio_pts_offset_valid = false;
+  source->last_audio_pts_ns = 0;
+  source->last_audio_pts_mono_ns = 0;
+  source->last_video_capture_time_ns = 0;
+  source->last_video_capture_mono_ns = 0;
+  source->audio_waiting_for_anchor_since_ns = 0;
   multicam_status_set_sync_latency(source, 0);
   schedule_playout_delay(source, 0, true);
   multicam_status_set_connection(source, false, NULL, false, 0, 0);
@@ -1935,6 +2013,13 @@ static void *srt_receive_thread(void *data) {
       source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
       source->last_video_pts_ns = AV_NOPTS_VALUE;
       source->smoothed_input_latency_ns = 0;
+      source->audio_pts_offset_ns = 0;
+      source->audio_pts_offset_valid = false;
+      source->last_audio_pts_ns = 0;
+      source->last_audio_pts_mono_ns = 0;
+      source->last_video_capture_time_ns = 0;
+      source->last_video_capture_mono_ns = 0;
+      source->audio_waiting_for_anchor_since_ns = 0;
       multicam_status_set_sync_latency(source, 0);
       schedule_playout_delay(source, 0, true);
       receiver_log(LOG_INFO, source,
