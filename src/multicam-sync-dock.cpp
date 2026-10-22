@@ -9,6 +9,7 @@
 #include <QColor>
 #include <QAbstractItemView>
 #include <QDir>
+#include <QEvent>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
