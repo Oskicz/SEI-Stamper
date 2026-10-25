@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "../src/receiver-time.h"
 
 /* ─── OBS shims ────────────────────────────────────────────────────────── */
 
@@ -691,6 +692,71 @@ static void test_ntp_sync_anchor_is_offset_corrected(void) {
               "anchor survives the NTP timestamp round-trip");
 }
 
+static void test_audio_pts_epoch_is_anchored_to_video_capture_clock(void) {
+  printf("  independent audio PTS epoch is aligned to video capture clock...\\n");
+  int64_t audio_offset_ns = 0;
+  ASSERT_TRUE(receiver_audio_pts_anchor_offset_ns(
+                  100000000000LL, 101000000000ULL, 2200000000LL,
+                  100000000000ULL, &audio_offset_ns),
+              "audio PTS observed before video is projected to its clock");
+  ASSERT_TRUE(audio_offset_ns == 96800000000LL,
+              "independent audio PTS origin is removed at the anchor");
+  int64_t mapped_audio_ns = 0;
+  ASSERT_TRUE(receiver_add_signed_ns(3200000000LL, audio_offset_ns,
+                                     &mapped_audio_ns),
+              "audio PTS maps safely into the video clock");
+  ASSERT_TRUE(mapped_audio_ns == 100000000000LL,
+              "audio progression remains on the anchored capture timeline");
+  ASSERT_TRUE(receiver_smooth_audio_pts_offset_ns(
+                  audio_offset_ns, audio_offset_ns + 160000000LL) ==
+                  audio_offset_ns + 10000000LL,
+              "subsequent A/V corrections are slewed instead of jumped");
+  ASSERT_TRUE(!receiver_add_signed_ns(INT64_MAX, 1, &mapped_audio_ns),
+              "signed timestamp mapping rejects overflow");
+}
+
+static void test_audio_decoder_recovery_threshold(void) {
+  printf("  audio decoder recovery is burst-triggered and throttled...\n");
+  ASSERT_TRUE(!receiver_audio_decoder_recovery_due(2, 1000000000ULL, 0),
+              "one or two decode errors do not flush the audio decoder");
+  ASSERT_TRUE(receiver_audio_decoder_recovery_due(3, 1000000000ULL, 0),
+              "three consecutive decode errors request recovery");
+  ASSERT_TRUE(!receiver_audio_decoder_recovery_due(
+                  3, 1500000000ULL, 1000000000ULL),
+              "repeated recovery is suppressed during the cooldown");
+  ASSERT_TRUE(receiver_audio_decoder_recovery_due(
+                  3, 2000000000ULL, 1000000000ULL),
+              "recovery becomes available when cooldown expires");
+  ASSERT_TRUE(!receiver_audio_decoder_recovery_due(
+                  3, 900000000ULL, 1000000000ULL),
+              "a regressed monotonic clock cannot bypass the cooldown");
+}
+
+static void test_playout_timestamps_use_common_latency(void) {
+  printf("  scheduled output timestamps add the common group latency...\n");
+  ASSERT_TRUE(receiver_add_playout_latency_ns(10000000000ULL, 1800000000ULL) ==
+              11800000000ULL, "shared output time includes measured group latency");
+  ASSERT_TRUE(receiver_add_playout_latency_ns(10000000000ULL, 0) ==
+              10000000000ULL, "zero group latency preserves the input timestamp");
+  ASSERT_TRUE(receiver_add_playout_latency_ns(UINT64_MAX - 3, 10) == UINT64_MAX,
+              "timestamp addition saturates instead of wrapping around");
+}
+
+static void test_playout_delay_updates_are_stable(void) {
+  printf("  playout delay ignores jitter and waits for stable corrections...\n");
+  receiver_playout_delay_control_t control = {0};
+  uint64_t applied = UINT64_MAX;
+  ASSERT_TRUE(receiver_playout_delay_consider(&control, 900000000ULL, 1000000000ULL, &applied), "initial target is applied immediately");
+  ASSERT_TRUE(applied == 900000000ULL, "initial target becomes active");
+  ASSERT_TRUE(!receiver_playout_delay_consider(&control, 950000000ULL, 2000000000ULL, &applied), "small jitter is not applied");
+  ASSERT_TRUE(!receiver_playout_delay_consider(&control, 970000000ULL, 2300000000ULL, &applied), "jitter remains below correction threshold");
+  ASSERT_TRUE(!receiver_playout_delay_consider(&control, 960000000ULL, 2600000000ULL, &applied), "jitter does not reset the active delay");
+  ASSERT_TRUE(applied == 900000000ULL, "jitter retains the applied delay");
+  ASSERT_TRUE(!receiver_playout_delay_consider(&control, 1300000000ULL, 4000000000ULL, &applied), "large correction starts a stability window");
+  ASSERT_TRUE(receiver_playout_delay_consider(&control, 1310000000ULL, 4800000000ULL, &applied), "stable correction applies after settle and cooldown");
+  ASSERT_TRUE(applied == 1310000000ULL, "stable target becomes active");
+}
+
 /* ─── Main ─────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -698,10 +764,69 @@ int main(void) {
   printf("======================\n\n");
 
   printf("[NTP epoch conversion]\n");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000000LL, 0),
+            1000000000LL, "zero audio calibration preserves existing timestamp");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000000LL, 5000000LL),
+            1005000000LL, "positive calibration delays audio");
+  ASSERT_EQ(receiver_audio_timestamp_with_offset(1000000LL, -2000000LL), 0,
+            "negative calibration saturates below zero");
+  ASSERT_EQ(receiver_ntp_max_age_seconds(10000), 120,
+            "short NTP interval keeps the minimum freshness window");
+  ASSERT_EQ(receiver_ntp_max_age_seconds(3600000), 3600,
+            "long NTP interval scales freshness up to one hour");
+  ASSERT_TRUE(receiver_keep_absolute_sync(true, true, true),
+              "fresh NTP anchor remains active between metadata frames");
+  ASSERT_TRUE(!receiver_keep_absolute_sync(true, true, false),
+              "stale NTP anchor falls back to PTS");
+  ASSERT_TRUE(!receiver_keep_absolute_sync(true, false, true),
+              "disabled NTP anchor falls back to PTS");
+  int64_t projected_unix_ns = 0;
+  ASSERT_TRUE(receiver_monotonic_to_unix_ns(10500000000LL, 10000000000LL,
+                                            1791986568000000000LL,
+                                            &projected_unix_ns),
+              "project frame monotonic timestamp through fresh NTP anchor");
+  ASSERT_EQ(projected_unix_ns, 1791986568500000000LL,
+            "projected UTC advances with video PTS");
+  ASSERT_TRUE(!receiver_monotonic_to_unix_ns(INT64_MAX, 0,
+                                              INT64_MAX, &projected_unix_ns),
+              "reject overflowing UTC projection");
+  ASSERT_EQ(receiver_pts_to_ns(48000, 1, 48000), 1000000000LL,
+            "audio PTS at 48 kHz converts to one second in ns");
+  ASSERT_EQ(receiver_pts_to_ns(90000, 1, 90000), 1000000000LL,
+            "video PTS at 90 kHz converts to one second in ns");
+  ASSERT_EQ(receiver_pts_to_ns(-24000, 1, 48000), -500000000LL,
+            "negative PTS preserves signed nanoseconds");
+  ASSERT_TRUE(receiver_pts_has_backward_reset(10000000000LL, 1000000000LL,
+                                               500000000ULL),
+              "detect a video PTS reset when a live source changes");
+  ASSERT_TRUE(!receiver_pts_has_backward_reset(10000000000LL, 9900000000LL,
+                                                500000000ULL),
+              "ignore a small PTS rewind below the reset threshold");
+  ASSERT_TRUE(receiver_video_is_stale(10000000000ULL, 12000000000ULL,
+                                      2000000000ULL),
+              "clear video at the two-second stale threshold");
+  ASSERT_TRUE(!receiver_video_is_stale(10000000000ULL, 11999999999ULL,
+                                       2000000000ULL),
+              "keep video visible before the stale threshold");
+  ASSERT_EQ(receiver_pts_to_ns(1, 0, 48000), 0,
+            "invalid time base is rejected");
+  int64_t display_ns = 0;
+  ASSERT_TRUE(receiver_ntp_to_monotonic_ns(3927441601U, 0, 3927441600U, 0,
+                                            5000000000LL, &display_ns),
+              "NTP timestamp maps through monotonic anchor");
+  ASSERT_EQ(display_ns, 6000000000LL,
+            "NTP frame one second ahead maps one second ahead monotonically");
+  ASSERT_TRUE(!receiver_ntp_to_monotonic_ns(0, 0, 3927441600U, 0,
+                                             5000000000LL, &display_ns),
+              "invalid NTP epoch is rejected");
   test_ntp_epoch_conversion_roundtrip();
   test_ntp_fractional_precision();
   test_ntp_conversion_known_values();
   test_ntp_sync_anchor_is_offset_corrected();
+  test_audio_pts_epoch_is_anchored_to_video_capture_clock();
+  test_audio_decoder_recovery_threshold();
+  test_playout_timestamps_use_common_latency();
+  test_playout_delay_updates_are_stable();
   test_ntp_sanity_check();
 
   printf("\n[SEI payload]\n");
@@ -727,3 +852,4 @@ int main(void) {
 
   return tests_failed;
 }
+

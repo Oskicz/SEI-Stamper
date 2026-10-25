@@ -107,6 +107,8 @@ cmake --install build --config Release --prefix out/obs-studio
 
 The DLL is `build/plugin/Release/sei-stamper.dll`; the installable tree is `out/obs-studio/`. CMake installation stages only the plugin and `data/`, not SRT or other runtime dependencies.
 
+The GitHub Actions workflow `.github/workflows/windows-obs-32.2.2.yml` builds against the OBS **32.2.2 source tag** and its pinned `2026-07-15` dependency bundle, runs the standalone timestamp and sample-conversion tests, checks the x64 DLL, and uploads `sei-stamper-windows-obs-32.2.2-x64.zip` as a 90-day Actions artifact. Open the successful run's **Artifacts** section to download the ZIP. The tests use synthetic timestamps and audio samples; they do not exercise live playback or GPU encoding.
+
 Alternatively, from the project root:
 
 ```powershell
@@ -125,7 +127,7 @@ Run from the project root:
 .\tests\run_tests.bat
 ```
 
-The local run on **2026-09-05 passed 60 checks with 0 failures**. These cover NTP conversion and sync anchoring, SEI payload layout, NAL scanning and extradata conversion. The test file copies pure functions instead of linking production sources; it does not test NTP networking, threads, OBS loading, GPUs or multi-stream synchronization. (Sources: [runner](tests/run_tests.bat), [test implementation](tests/test_ntp_sei.c).)
+The standalone checks cover NTP conversion and sync anchoring, PTS conversion for 48 kHz and 90 kHz streams, NTP-to-monotonic mapping, SEI payload layout, NAL scanning and extradata conversion. A separate FFmpeg `libswresample` test verifies packed S16 samples become planar float samples. These tests need no hardware encoder or audio device. They do not test NTP networking, OBS loading, GPU encoding, multi-stream SRT or actual audio playback. (Sources: [runner](tests/run_tests.bat), [pure-function tests](tests/test_ntp_sei.c), [sample conversion test](tests/test_audio_conversion.c), [workflow](.github/workflows/windows-obs-32.2.2.yml).)
 
 On the same date, the 1.3.0 Windows x64 Release build passed using MSVC 19.50 / CMake 4.2.1 / Ninja. DLL loading, `obs_module_ver()` and SRT protocol lookup passed against the official OBS 32.2.2 portable runtime. This package uses official 32.2.2 headers and OBS/pthread import libraries generated from that version's DLL exports. OBS plugin initialization, GPU processing and streaming were not tested. (Source: build record included in the [v1.3.0 release assets](https://github.com/ikenainanodesu/SEI-Stamper/releases/tag/v1.3.0).)
 
@@ -184,6 +186,18 @@ See the [LICENSE](LICENSE) file for details.
 - Add standalone pure-function checks. See the validation section above for the current run and coverage limits.
 
 Sources: [NTP client](src/ntp-client.c), [NVENC](src/nvenc-encoder.c), [AMF](src/amd-encoder.c), [QSV](src/qsv-encoder.c), [receiver](src/sei-receiver-source.c), [CMake](CMakeLists.txt), [tests](tests/test_ntp_sei.c).
+
+### Multicam Sync Center (OBS 32.2.2)
+
+The receiver registers itself in the **Multicam Sync Center** dock. The dock reports live connection/video/audio flow, decoded codec and FPS, NTP freshness, the timestamp mode actually used, automatic video PTS offset, manual audio offset, and the spread between recent absolute camera timestamps. RX rate is measured from FFmpeg `av_read_frame()` packet payload bytes, as a one-second sample and five-sample average; it excludes SRT, MPEG-TS, and IP transport overhead. A PTS fallback is shown explicitly and cannot pass preflight.
+
+Preflight requires at least two receiver sources, recent packets/video, recent audio when an audio stream exists, a measured non-zero receive bitrate, a fresh NTP anchor, absolute timestamp metadata, and a timestamp spread no greater than 16.67 ms (one 60 FPS frame). This checks that audio is flowing; it does **not** verify acoustic or lip-sync correctness. Verify audio with a playback test before an event.
+
+The receiver supports the existing SEI-Stamper UUID timestamp and Moblin's HEVC `time_code` SEI (payload type 136). Moblin timecode has no date; the receiver resolves its time of day to the nearest UTC date using a fresh NTP clock. It falls back to PTS if the NTP anchor, frame rate, or timecode is unavailable or ambiguous. Set the sender's Moblin timecode option on and use NTP on the receiver.
+
+The receiver property **Audio offset relative to video (ms)** applies a manual calibration from -500 to +500 ms. Zero preserves the default audio timestamps. Positive values delay audio. Use it only after measuring the actual audio path.
+
+The redacted diagnostics export intentionally omits source names, SRT URLs, stream IDs, hostnames, and credentials.
 
 The entries below are retained historical release notes, not current compatibility or validation claims.
 
@@ -252,3 +266,4 @@ The entries below are retained historical release notes, not current compatibili
 
 **Current Version**: 1.3.0
 **Last Updated**: 2026-09-05
+

@@ -60,6 +60,30 @@ set_target_properties(OBS::libobs PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${LIBOBS_INCLUDE_DIR}"
 )
 
+# OBS 32.2.2 frontend dock API and its Qt6 widget runtime.
+set(OBS_FRONTEND_API_INCLUDE_DIR "${OBS_SOURCE_DIR}/frontend/api")
+set(OBS_FRONTEND_API_LIB_DIR "${OBS_BUILD_DIR}/frontend/api/Release")
+set(OBS_FRONTEND_API_BIN_DIR "${OBS_BUILD_DIR}/rundir/Release/bin/64bit")
+if(NOT EXISTS "${OBS_FRONTEND_API_LIB_DIR}/obs-frontend-api.lib")
+    message(FATAL_ERROR "OBS 32.2.2 frontend API import library not found at ${OBS_FRONTEND_API_LIB_DIR}/obs-frontend-api.lib")
+endif()
+add_library(OBS::frontend-api SHARED IMPORTED)
+set_target_properties(OBS::frontend-api PROPERTIES
+    IMPORTED_LOCATION "${OBS_FRONTEND_API_BIN_DIR}/obs-frontend-api.dll"
+    IMPORTED_IMPLIB "${OBS_FRONTEND_API_LIB_DIR}/obs-frontend-api.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${OBS_FRONTEND_API_INCLUDE_DIR}"
+)
+
+file(GLOB _OBS_QT6_CANDIDATES "${OBS_SOURCE_DIR}/.deps/obs-deps-qt6-20??-??-??-x64")
+list(SORT _OBS_QT6_CANDIDATES)
+list(REVERSE _OBS_QT6_CANDIDATES)
+if(NOT _OBS_QT6_CANDIDATES)
+    message(FATAL_ERROR "The OBS 32.2.2 Qt6 dependency bundle was not found under ${OBS_SOURCE_DIR}/.deps")
+endif()
+list(GET _OBS_QT6_CANDIDATES 0 OBS_QT6_DEPS_DIR)
+list(PREPEND CMAKE_PREFIX_PATH "${OBS_QT6_DEPS_DIR}")
+find_package(Qt6 CONFIG REQUIRED COMPONENTS Widgets)
+
 message(STATUS "libobs include: ${LIBOBS_INCLUDE_DIR}")
 message(STATUS "libobs lib:     ${LIBOBS_LIB_DIR}/obs.lib")
 
@@ -74,6 +98,8 @@ set(PLUGIN_SOURCES
     src/nvenc-encoder.c
     src/amd-encoder.c
     src/sei-receiver-source.c
+    src/multicam-status.c
+    src/multicam-sync-dock.cpp
 )
 
 add_library(sei-stamper MODULE ${PLUGIN_SOURCES})
@@ -120,13 +146,48 @@ set(FFMPEG_LIB_DIR "${OBS_DEPS_DIR}/lib")
 
 target_link_libraries(sei-stamper
     OBS::libobs
+    OBS::frontend-api
+    Qt6::Widgets
     ws2_32
     ${PTHREAD_LIBRARY}
     "${FFMPEG_LIB_DIR}/avcodec.lib"
     "${FFMPEG_LIB_DIR}/avformat.lib"
     "${FFMPEG_LIB_DIR}/avutil.lib"
+    "${FFMPEG_LIB_DIR}/swresample.lib"
     "${FFMPEG_LIB_DIR}/swscale.lib"
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(sei-core-tests tests/test_ntp_sei.c)
+    target_include_directories(sei-core-tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME sei-core-tests COMMAND sei-core-tests)
+
+    add_executable(sei-audio-conversion-tests tests/test_audio_conversion.c)
+    target_include_directories(sei-audio-conversion-tests PRIVATE ${OBS_DEPS_DIR}/include)
+    target_link_libraries(sei-audio-conversion-tests
+        "${FFMPEG_LIB_DIR}/swresample.lib"
+        "${FFMPEG_LIB_DIR}/avutil.lib"
+    )
+    add_test(NAME sei-audio-conversion-tests COMMAND sei-audio-conversion-tests)
+
+    add_executable(sei-moblin-timecode-tests tests/test_moblin_timecode.c)
+    target_include_directories(sei-moblin-timecode-tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME sei-moblin-timecode-tests COMMAND sei-moblin-timecode-tests)
+
+    add_executable(sei-multicam-status-tests
+        tests/test_multicam_status.c
+        src/multicam-status.c
+    )
+    target_include_directories(sei-multicam-status-tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${OBS_SOURCE_DIR}/deps/w32-pthreads
+    )
+    if(PTHREAD_LIBRARY)
+        target_link_libraries(sei-multicam-status-tests ${PTHREAD_LIBRARY})
+    endif()
+    add_test(NAME sei-multicam-status-tests COMMAND sei-multicam-status-tests)
+endif()
 
 # --- x264 ---
 set(X264_LIBRARY "${OBS_DEPS_DIR}/lib/libx264.lib")
@@ -158,6 +219,7 @@ find_library(SRT_LIBRARY NAMES srt libsrt
     "${CMAKE_SOURCE_DIR}/srt/_build/Release"
     "${OBS_BUILD_DIR}/rundir/Release/bin/64bit"
     "${OBS_SOURCE_DIR}/plugins/obs-outputs"
+    "${OBS_DEPS_DIR}/lib"
 )
 if(SRT_LIBRARY)
     message(STATUS "Found SRT: ${SRT_LIBRARY}")
@@ -187,3 +249,4 @@ install(DIRECTORY data/
 message(STATUS "=================================================")
 message(STATUS "SEI Stamper Plugin v${PROJECT_VERSION}")
 message(STATUS "=================================================")
+
