@@ -1102,7 +1102,12 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
 
   AVCodecContext *ctx = (AVCodecContext *)source->audio_codec_context;
   int ret = avcodec_send_packet(ctx, packet);
-  if (ret < 0) {
+  /* FFmpeg's send/receive API is a strict pair: EAGAIN means decoded output
+   * must be drained before this same input packet can be retried. Treating it
+   * as a fatal error silently discarded audio exactly when the decoder was
+   * back-pressured after a transport hiccup. */
+  bool packet_pending = ret == AVERROR(EAGAIN);
+  if (ret < 0 && !packet_pending) {
     receiver_log(LOG_ERROR, source, "Error sending audio packet: %d", ret);
     record_audio_decode_error(source);
     return false;
@@ -1116,11 +1121,25 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
   }
 
   bool success = true;
-  while (ret >= 0) {
+  while (true) {
     ret = avcodec_receive_frame(ctx, frame);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+    if (ret == AVERROR(EAGAIN)) {
+      if (!packet_pending)
+        break;
+      ret = avcodec_send_packet(ctx, packet);
+      if (ret >= 0) {
+        packet_pending = false;
+        continue;
+      }
+      receiver_log(LOG_ERROR, source,
+                   "Error retrying audio packet after draining decoder: %d", ret);
+      record_audio_decode_error(source);
+      success = false;
       break;
-    } else if (ret < 0) {
+    }
+    if (ret == AVERROR_EOF)
+      break;
+    if (ret < 0) {
       receiver_log(LOG_ERROR, source, "Error receiving audio frame: %d", ret);
       record_audio_decode_error(source);
       success = false;
