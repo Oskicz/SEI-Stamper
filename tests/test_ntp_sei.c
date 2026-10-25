@@ -715,6 +715,23 @@ static void test_audio_pts_epoch_is_anchored_to_video_capture_clock(void) {
               "signed timestamp mapping rejects overflow");
 }
 
+static void test_audio_decoder_recovery_threshold(void) {
+  printf("  audio decoder recovery is burst-triggered and throttled...\n");
+  ASSERT_TRUE(!receiver_audio_decoder_recovery_due(2, 1000000000ULL, 0),
+              "one or two decode errors do not flush the audio decoder");
+  ASSERT_TRUE(receiver_audio_decoder_recovery_due(3, 1000000000ULL, 0),
+              "three consecutive decode errors request recovery");
+  ASSERT_TRUE(!receiver_audio_decoder_recovery_due(
+                  3, 1500000000ULL, 1000000000ULL),
+              "repeated recovery is suppressed during the cooldown");
+  ASSERT_TRUE(receiver_audio_decoder_recovery_due(
+                  3, 2000000000ULL, 1000000000ULL),
+              "recovery becomes available when cooldown expires");
+  ASSERT_TRUE(!receiver_audio_decoder_recovery_due(
+                  3, 900000000ULL, 1000000000ULL),
+              "a regressed monotonic clock cannot bypass the cooldown");
+}
+
 static void test_playout_timestamps_use_common_latency(void) {
   printf("  scheduled output timestamps add the common group latency...\n");
   ASSERT_TRUE(receiver_add_playout_latency_ns(10000000000ULL, 1800000000ULL) ==
@@ -807,6 +824,7 @@ int main(void) {
   test_ntp_conversion_known_values();
   test_ntp_sync_anchor_is_offset_corrected();
   test_audio_pts_epoch_is_anchored_to_video_capture_clock();
+  test_audio_decoder_recovery_threshold();
   test_playout_timestamps_use_common_latency();
   test_playout_delay_updates_are_stable();
   test_ntp_sanity_check();

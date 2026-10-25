@@ -248,6 +248,21 @@ static inline uint64_t receiver_audio_timestamp_with_offset(int64_t timestamp_ns
   return adjusted > 0 ? (uint64_t)adjusted : 0;
 }
 
+#define RECEIVER_AUDIO_DECODER_ERROR_BURST 3U
+#define RECEIVER_AUDIO_DECODER_FLUSH_COOLDOWN_NS 1000000000ULL
+
+static inline bool receiver_audio_decoder_recovery_due(uint32_t consecutive_errors,
+                                                       uint64_t now_ns,
+                                                       uint64_t last_flush_ns)
+{
+  if (consecutive_errors < RECEIVER_AUDIO_DECODER_ERROR_BURST)
+    return false;
+  if (!last_flush_ns)
+    return true;
+  return now_ns >= last_flush_ns &&
+         now_ns - last_flush_ns >= RECEIVER_AUDIO_DECODER_FLUSH_COOLDOWN_NS;
+}
+
 static inline uint32_t receiver_ntp_max_age_seconds(uint32_t sync_interval_ms)
 {
   uint64_t interval_seconds = ((uint64_t)sync_interval_ms + 999ULL) / 1000ULL;

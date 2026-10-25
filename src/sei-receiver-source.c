@@ -351,8 +351,29 @@ static void record_audio_decode_error(sei_receiver_source_t *source)
   if (!source)
     return;
   source->audio_decode_errors_total++;
+  if (source->audio_decode_error_streak < UINT32_MAX)
+    source->audio_decode_error_streak++;
   multicam_status_set_audio_decode_errors(source,
                                           source->audio_decode_errors_total);
+
+  uint64_t now_ns = os_gettime_ns();
+  if (!source->audio_codec_context ||
+      !receiver_audio_decoder_recovery_due(source->audio_decode_error_streak,
+                                           now_ns,
+                                           source->audio_decoder_last_flush_ns))
+    return;
+
+  avcodec_flush_buffers((AVCodecContext *)source->audio_codec_context);
+  if (source->audio_resampler) {
+    SwrContext *resampler = (SwrContext *)source->audio_resampler;
+    swr_free(&resampler);
+    source->audio_resampler = NULL;
+  }
+  av_channel_layout_uninit(&source->audio_resampler_layout);
+  source->audio_decoder_last_flush_ns = now_ns;
+  source->audio_decode_error_streak = 0;
+  receiver_log(LOG_WARNING, source,
+               "Audio decoder recovered after repeated decode errors");
 }
 
 static void clear_output_video(sei_receiver_source_t *source)
@@ -1146,6 +1167,7 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       break;
     }
 
+    source->audio_decode_error_streak = 0;
     struct obs_source_audio audio = {0};
     int channels = frame->ch_layout.nb_channels;
     if (channels <= 0 || channels > MAX_AUDIO_CHANNELS || frame->sample_rate <= 0) {
@@ -1793,6 +1815,8 @@ static void cleanup_connection(sei_receiver_source_t *source) {
     source->audio_resampler = NULL;
   }
   av_channel_layout_uninit(&source->audio_resampler_layout);
+  source->audio_decode_error_streak = 0;
+  source->audio_decoder_last_flush_ns = 0;
   source->is_connected = false;
   source->has_pts_offset = false;
   source->pts_offset = 0;

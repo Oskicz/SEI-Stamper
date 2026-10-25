@@ -150,6 +150,8 @@ typedef struct sei_receiver_source {
   uint64_t frames_dropped;        /* frames dropped */
   uint64_t decode_errors_total;   /* cumulative video decoder errors */
   uint64_t audio_decode_errors_total;
+  uint32_t audio_decode_error_streak;
+  uint64_t audio_decoder_last_flush_ns;
   uint64_t audio_frames_received; /* decoded audio frames output to OBS */
   uint64_t rx_bytes_total;        /* demuxed packet bytes, cumulative */
   uint64_t rx_bytes_window;       /* packet bytes since last bitrate sample */
