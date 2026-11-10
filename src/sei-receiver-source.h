@@ -73,14 +73,8 @@ typedef struct sei_receiver_source {
   int64_t last_video_pts_ns;
   uint64_t last_video_output_mono_ns;
   bool video_output_cleared;
-  obs_source_t *playout_delay_filter;
-  pthread_mutex_t playout_filter_lock;
-  bool playout_filter_lock_initialized;
-  uint64_t playout_delay_ns;
   uint64_t smoothed_input_latency_ns;
   receiver_playout_delay_control_t playout_delay_control;
-  bool playout_filter_warning_logged;
-  bool playout_delay_cap_warning_logged;
 
   /* Video decode */
   void *format_context;       /* FFmpeg format context (demux) */

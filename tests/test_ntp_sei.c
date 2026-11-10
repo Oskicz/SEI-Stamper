@@ -738,6 +738,12 @@ static void test_playout_timestamps_use_common_latency(void) {
               11800000000ULL, "shared output time includes measured group latency");
   ASSERT_TRUE(receiver_add_playout_latency_ns(10000000000ULL, 0) ==
               10000000000ULL, "zero group latency preserves the input timestamp");
+  uint64_t source_a = receiver_add_playout_latency_ns(
+      10000000000ULL, 1500000000ULL);
+  uint64_t source_b = receiver_add_playout_latency_ns(
+      10000300000ULL, 1500000000ULL);
+  ASSERT_TRUE(source_b - source_a == 300000ULL,
+              "the same output offset preserves camera-to-camera timestamp spacing");
   ASSERT_TRUE(receiver_add_playout_latency_ns(UINT64_MAX - 3, 10) == UINT64_MAX,
               "timestamp addition saturates instead of wrapping around");
 }

@@ -409,81 +409,17 @@ static int interrupt_if_video_stale(void *opaque)
   return 0;
 }
 
-typedef struct playout_filter_update {
-  obs_source_t *filter;
-  uint32_t delay_ms;
-} playout_filter_update_t;
-
-static void apply_playout_filter_update(void *opaque)
-{
-  playout_filter_update_t *update = (playout_filter_update_t *)opaque;
-  if (!update) return;
-  obs_data_t *settings = obs_data_create();
-  obs_data_set_int(settings, "delay_ms", update->delay_ms);
-  obs_source_update(update->filter, settings);
-  obs_data_release(settings);
-  obs_source_release(update->filter);
-  bfree(update);
-}
-
+/* Keep playout delay in timestamps, not an OBS async-delay filter.
+ * libobs buffers OBS_SOURCE_ASYNC_VIDEO frames by timestamp and synchronizes
+ * source audio to that video. Updating async-delay settings clears its queue,
+ * which caused visible stalls whenever measured network age changed. */
 static void schedule_playout_delay(sei_receiver_source_t *source,
                                   uint64_t delay_ns, bool force)
 {
-  if (!source || !source->playout_filter_lock_initialized) return;
-  pthread_mutex_lock(&source->playout_filter_lock);
-  if (delay_ns > MAX_SYNC_PLAYOUT_DELAY_NS) {
-    if (!source->playout_delay_cap_warning_logged) {
-      source->playout_delay_cap_warning_logged = true;
-      receiver_log(LOG_WARNING, source,
-                   "Required playout delay exceeds the 2000 ms safety cap; output may remain misaligned");
-    }
-    delay_ns = MAX_SYNC_PLAYOUT_DELAY_NS;
-  }
-  if (force)
-    receiver_playout_delay_reset(&source->playout_delay_control);
-  uint64_t applied_delay_ns = source->playout_delay_ns;
-  bool update_filter = receiver_playout_delay_consider(
-      &source->playout_delay_control, delay_ns, os_gettime_ns(),
-      &applied_delay_ns);
-  source->playout_delay_ns = applied_delay_ns;
-  multicam_status_set_playout_delay(source, applied_delay_ns);
-  if (!update_filter) {
-    pthread_mutex_unlock(&source->playout_filter_lock);
-    return;
-  }
-
-  if (!source->playout_delay_filter) {
-    source->playout_delay_ns = 0;
+  UNUSED_PARAMETER(delay_ns);
+  UNUSED_PARAMETER(force);
+  if (source)
     multicam_status_set_playout_delay(source, 0);
-    if (!source->playout_filter_warning_logged) {
-      source->playout_filter_warning_logged = true;
-      receiver_log(LOG_WARNING, source,
-                   "OBS async-delay filter unavailable; cannot align this receiver's playout");
-    }
-    pthread_mutex_unlock(&source->playout_filter_lock);
-    return;
-  }
-  playout_filter_update_t *update = bzalloc(sizeof(*update));
-  if (!update) {
-    pthread_mutex_unlock(&source->playout_filter_lock);
-    return;
-  }
-  /* OBS 32.2.2 exports obs_source_get_ref(), not obs_source_addref(). */
-  update->filter = obs_source_get_ref(source->playout_delay_filter);
-  if (!update->filter) {
-    bfree(update);
-    pthread_mutex_unlock(&source->playout_filter_lock);
-    return;
-  }
-  update->delay_ms = (uint32_t)((applied_delay_ns + 500000ULL) / 1000000ULL);
-  source->playout_delay_ns = applied_delay_ns;
-  multicam_status_set_playout_delay(source, applied_delay_ns);
-  uint32_t delay_ms = update->delay_ms;
-  pthread_mutex_unlock(&source->playout_filter_lock);
-  obs_queue_task(OBS_TASK_UI, apply_playout_filter_update, update, false);
-  receiver_log(LOG_INFO, source,
-               "Scheduling stable OBS playout delay update: %u ms (group maximum input age)",
-               delay_ms);
 }
 
 typedef struct managed_filter_list {
@@ -505,18 +441,6 @@ static bool collect_managed_playout_filter(obs_source_t *parent,
     return true;
   list->filters[list->count++] = obs_source_get_ref(filter);
   return true;
-}
-
-static obs_source_t *create_playout_filter(obs_source_t *parent)
-{
-  obs_data_t *settings = obs_data_create();
-  if (!settings) return NULL;
-  obs_data_set_int(settings, "delay_ms", 0);
-  obs_source_t *filter = obs_source_create_private(
-      "async_delay_filter", "SEI Sync Playout Delay", settings);
-  obs_data_release(settings);
-  if (filter) obs_source_filter_add(parent, filter);
-  return filter;
 }
 
 void sei_receiver_cleanup_playout_filters(void)
@@ -547,12 +471,6 @@ void sei_receiver_cleanup_playout_filters(void)
   for (size_t i = 0; i < target_count; ++i) {
     sei_receiver_source_t *context = targets[i].context;
     obs_source_t *parent = targets[i].source;
-    if (!context->playout_filter_lock_initialized) {
-      obs_source_release(parent);
-      continue;
-    }
-    pthread_mutex_lock(&context->playout_filter_lock);
-
     size_t filter_count = obs_source_filter_count(parent);
     obs_source_t **filters = filter_count
         ? (obs_source_t **)bzalloc(filter_count * sizeof(*filters)) : NULL;
@@ -564,22 +482,7 @@ void sei_receiver_cleanup_playout_filters(void)
     }
     if (filters) bfree(filters);
 
-    if (context->playout_delay_filter) {
-      obs_source_release(context->playout_delay_filter);
-      context->playout_delay_filter = NULL;
-    }
-    receiver_playout_delay_reset(&context->playout_delay_control);
-    context->playout_delay_ns = 0;
     multicam_status_set_playout_delay(context, 0);
-    context->playout_delay_filter = create_playout_filter(parent);
-    if (!context->playout_delay_filter)
-      receiver_log(LOG_WARNING, context,
-                   "Could not recreate the single managed playout delay filter");
-    else
-      receiver_log(LOG_INFO, context,
-                   "Removed duplicate persisted playout filters; exactly one managed filter is active");
-
-    pthread_mutex_unlock(&context->playout_filter_lock);
     obs_source_release(parent);
   }
   if (targets) bfree(targets);
@@ -983,11 +886,10 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     schedule_playout_delay(source, 0, true);
   }
 
-  /* The OBS async-delay filter releases a fast input at capture time plus
-   * the per-source wait. The slower inputs arrive at that same target time.
-   * Shift both video and audio timestamps by the common group latency so OBS
-   * receives frames at their scheduled presentation time instead of treating
-   * them as stale frames from the past. */
+  /* The shared group latency is added to each NTP-mapped timestamp.
+   * OBS buffers future async-video frames by timestamp, and automatically
+   * synchronizes this source's audio to that video. No external delay filter
+   * is needed; changing one clears its frame queue and creates a visible stall. */
   obs_frame.timestamp = receiver_add_playout_latency_ns(
       obs_frame.timestamp, group_playout_latency_ns);
 
@@ -1397,21 +1299,7 @@ static void *receiver_source_create(obs_data_t *settings,
     return NULL;
   }
   ctx->audio_settings_lock_initialized = true;
-  if (pthread_mutex_init(&ctx->playout_filter_lock, NULL) != 0) {
-    pthread_mutex_destroy(&ctx->audio_settings_lock);
-    frame_buffer_destroy(&ctx->frame_buffer);
-    bfree(ctx);
-    return NULL;
-  }
-  ctx->playout_filter_lock_initialized = true;
   multicam_status_register(ctx, obs_source_get_name(source));
-
-  /* OBS persists attached filters in the scene collection. Existing managed
-   * filters are pruned after collection load so restarts never stack delays. */
-  ctx->playout_delay_filter = create_playout_filter(ctx->context);
-  if (!ctx->playout_delay_filter)
-    receiver_log(LOG_WARNING, ctx,
-                 "OBS async-delay filter was not available; adaptive playout alignment is disabled");
 
   /* Initialise the sync state */
   ctx->sync_state = SYNC_STATE_WAITING;
@@ -1506,16 +1394,6 @@ static void receiver_source_destroy(void *data) {
   unregister_receiver_context(ctx);
   stop_receiver(ctx);
   multicam_status_unregister(ctx);
-  if (ctx->playout_delay_filter) {
-    obs_source_filter_remove(ctx->context, ctx->playout_delay_filter);
-    obs_source_release(ctx->playout_delay_filter);
-    ctx->playout_delay_filter = NULL;
-  }
-  if (ctx->playout_filter_lock_initialized) {
-    pthread_mutex_destroy(&ctx->playout_filter_lock);
-    ctx->playout_filter_lock_initialized = false;
-  }
-
   /* avformat owns the SRT connection; no manual socket close */
 
   /* Destroy the decoder */
