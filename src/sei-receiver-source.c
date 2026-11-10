@@ -881,9 +881,6 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
         source, multicam_status_playout_delay(group_max_latency,
                                               source->smoothed_input_latency_ns),
         false);
-  } else if (source->playout_delay_ns) {
-    /* A stale absolute clock must not keep an old delay target alive. */
-    schedule_playout_delay(source, 0, true);
   }
 
   /* The shared group latency is added to each NTP-mapped timestamp.
