@@ -135,7 +135,7 @@ static void receiver_diagnostics_video_sample(
   double output_lead_ms = ((double)output_pts_ns - (double)now_ns) / 1000000.0;
   char line[512];
   snprintf(line, sizeof(line),
-      "{\"kind\":\"video\",\"source_id\":%llu,\"mono_ns\":%llu,\"sync_method\":%d,\"ntp_fresh\":%s,\"input_pts_ns\":%lld,\"output_pts_ns\":%llu,\"output_lead_ms\":%.3f,\"input_latency_ms\":%.3f,\"source_wait_ms\":%.3f,\"group_delay_ms\":%.3f,\"speed\":%.5f,\"fps\":%.3f,\"decode_errors\":%llu,\"pts_resets\":%llu}\n",
+      "{\"kind\":\"video\",\"source_id\":%llu,\"mono_ns\":%llu,\"sync_method\":%d,\"ntp_fresh\":%s,\"input_pts_ns\":%lld,\"output_pts_ns\":%llu,\"output_lead_ms\":%.3f,\"input_latency_ms\":%.3f,\"source_wait_ms\":%.3f,\"group_delay_ms\":%.3f,\"speed\":%.5f,\"fps\":%.3f,\"rx_bitrate_bps\":%llu,\"decode_errors\":%llu,\"pts_resets\":%llu}\n",
       (unsigned long long)source->diagnostic_source_id,
       (unsigned long long)now_ns, (int)source->sync_method,
       ntp_fresh ? "true" : "false", (long long)input_pts_ns,
@@ -148,6 +148,7 @@ static void receiver_diagnostics_video_sample(
           1000000.0,
       (double)group_delay_ns / 1000000.0, speed,
       (double)source->current_fps,
+      (unsigned long long)source->rx_bitrate_bps,
       (unsigned long long)source->decode_errors_total,
       (unsigned long long)source->video_pts_resets);
   receiver_diagnostics_write(source, line);
@@ -165,12 +166,13 @@ static void receiver_diagnostics_audio_sample(
   double output_lead_ms = ((double)output_pts_ns - (double)now_ns) / 1000000.0;
   char line[512];
   snprintf(line, sizeof(line),
-      "{\"kind\":\"audio\",\"source_id\":%llu,\"mono_ns\":%llu,\"input_sample_format\":%d,\"obs_sample_format\":%d,\"input_samples\":%d,\"output_samples\":%d,\"audio_timestamp_ns\":%llu,\"output_lead_ms\":%.3f,\"audio_anchor_offset_ms\":%.3f,\"group_delay_ms\":%.3f,\"speed\":%.5f,\"decode_errors\":%llu,\"pts_resets\":%llu,\"decoder_recoveries\":%llu}\n",
+      "{\"kind\":\"audio\",\"source_id\":%llu,\"mono_ns\":%llu,\"input_sample_format\":%d,\"obs_sample_format\":%d,\"input_samples\":%d,\"output_samples\":%d,\"audio_timestamp_ns\":%llu,\"output_lead_ms\":%.3f,\"audio_anchor_offset_ms\":%.3f,\"group_delay_ms\":%.3f,\"speed\":%.5f,\"rx_bitrate_bps\":%llu,\"decode_errors\":%llu,\"pts_resets\":%llu,\"decoder_recoveries\":%llu}\n",
       (unsigned long long)source->diagnostic_source_id,
       (unsigned long long)now_ns, input_format, output_format,
       input_samples, output_samples, (unsigned long long)output_pts_ns,
       output_lead_ms, (double)source->audio_pts_offset_ns / 1000000.0,
       (double)group_delay_ns / 1000000.0, speed,
+      (unsigned long long)source->rx_bitrate_bps,
       (unsigned long long)source->audio_decode_errors_total,
       (unsigned long long)source->audio_pts_resets,
       (unsigned long long)source->audio_decoder_recoveries);

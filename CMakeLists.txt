@@ -164,7 +164,7 @@ if(BUILD_TESTING)
         tests/test_diagnostics.c
         src/receiver-diagnostics.c
     )
-    target_include_directories(sei-diagnostics-tests PRIVATE \${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(sei-diagnostics-tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME sei-diagnostics-tests COMMAND sei-diagnostics-tests)
 
     add_executable(sei-core-tests tests/test_ntp_sei.c)
