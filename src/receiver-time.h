@@ -17,6 +17,155 @@ typedef struct receiver_playout_delay_control {
   uint64_t last_update_ns;
 } receiver_playout_delay_control_t;
 
+
+#define RECEIVER_AUDIO_JITTER_CUSHION_NS 120000000ULL
+#define RECEIVER_SYNC_SPEED_DEADBAND_NS 1000000ULL
+#define RECEIVER_SYNC_SPEED_SOFT_ERROR_NS 250000000ULL
+#define RECEIVER_SYNC_SPEED_MAX_ERROR_NS 1500000000ULL
+#define RECEIVER_SYNC_SPEED_MIN 0.85
+#define RECEIVER_SYNC_SPEED_MAX 1.15
+
+typedef struct receiver_group_delay_control {
+  bool initialized;
+  uint64_t applied_ns;
+  uint64_t last_update_ns;
+  double speed;
+} receiver_group_delay_control_t;
+
+typedef struct receiver_audio_output_clock {
+  bool initialized;
+  uint64_t anchor_ns;
+  uint64_t samples;
+  uint32_t sample_rate;
+} receiver_audio_output_clock_t;
+
+/* Positive skew speeds media up; negative skew slows it down. Map a small
+ * residual to at most 5% correction and large errors to at most 15%. */
+static inline double receiver_sync_speed_for_skew_ns(int64_t skew_ns)
+{
+  uint64_t magnitude = skew_ns < 0
+      ? (uint64_t)(-(skew_ns + 1)) + 1ULL : (uint64_t)skew_ns;
+  if (magnitude <= RECEIVER_SYNC_SPEED_DEADBAND_NS)
+    return 1.0;
+  double correction;
+  if (magnitude <= RECEIVER_SYNC_SPEED_SOFT_ERROR_NS) {
+    correction = 0.05 * (double)(magnitude - RECEIVER_SYNC_SPEED_DEADBAND_NS) /
+                 (double)(RECEIVER_SYNC_SPEED_SOFT_ERROR_NS -
+                          RECEIVER_SYNC_SPEED_DEADBAND_NS);
+  } else {
+    uint64_t extra = magnitude - RECEIVER_SYNC_SPEED_SOFT_ERROR_NS;
+    uint64_t range = RECEIVER_SYNC_SPEED_MAX_ERROR_NS -
+                     RECEIVER_SYNC_SPEED_SOFT_ERROR_NS;
+    if (extra > range) extra = range;
+    correction = 0.05 + 0.10 * (double)extra / (double)range;
+  }
+  return skew_ns > 0 ? 1.0 + correction : 1.0 - correction;
+}
+
+/* Slew the shared delay instead of jumping timestamps. Since every receiver
+ * uses this same clock, A/V and cameras keep one common presentation timeline. */
+static inline uint64_t receiver_group_delay_step(
+    receiver_group_delay_control_t *control, uint64_t target_ns,
+    uint64_t now_ns, double *playout_speed)
+{
+  if (!control) {
+    if (playout_speed) *playout_speed = 1.0;
+    return target_ns;
+  }
+  if (!control->initialized) {
+    control->initialized = true;
+    control->applied_ns = target_ns;
+    control->last_update_ns = now_ns;
+    control->speed = 1.0;
+    if (playout_speed) *playout_speed = control->speed;
+    return control->applied_ns;
+  }
+  if (now_ns < control->last_update_ns) {
+    control->last_update_ns = now_ns;
+    control->speed = 1.0;
+    if (playout_speed) *playout_speed = control->speed;
+    return control->applied_ns;
+  }
+
+  uint64_t elapsed_ns = now_ns - control->last_update_ns;
+  control->last_update_ns = now_ns;
+  if (elapsed_ns > 100000000ULL) elapsed_ns = 100000000ULL;
+  uint64_t magnitude = target_ns > control->applied_ns
+                           ? target_ns - control->applied_ns
+                           : control->applied_ns - target_ns;
+  double alpha = (double)elapsed_ns / 250000000.0;
+  if (alpha > 1.0) alpha = 1.0;
+  if (magnitude <= RECEIVER_SYNC_SPEED_DEADBAND_NS) {
+    control->applied_ns = target_ns;
+    control->speed = 1.0;
+  } else {
+    int64_t signed_skew = target_ns < control->applied_ns
+        ? (int64_t)magnitude : -(int64_t)magnitude;
+    double target_speed = receiver_sync_speed_for_skew_ns(signed_skew);
+    control->speed += (target_speed - control->speed) * alpha;
+    if (control->speed < RECEIVER_SYNC_SPEED_MIN)
+      control->speed = RECEIVER_SYNC_SPEED_MIN;
+    if (control->speed > RECEIVER_SYNC_SPEED_MAX)
+      control->speed = RECEIVER_SYNC_SPEED_MAX;
+    double delay_rate = 1.0 / control->speed - 1.0;
+    if (delay_rate < 0.0) delay_rate = -delay_rate;
+    long double desired_change = (long double)elapsed_ns * delay_rate;
+    uint64_t change_ns = (uint64_t)(desired_change + 0.5L);
+    if (change_ns >= magnitude) {
+      control->applied_ns = target_ns;
+      control->speed = 1.0;
+    } else if (target_ns > control->applied_ns) {
+      control->applied_ns += change_ns;
+    } else {
+      control->applied_ns -= change_ns;
+    }
+  }
+  if (playout_speed) *playout_speed = control->speed;
+  return control->applied_ns;
+}
+
+static inline int receiver_sync_output_samples(int input_samples, double speed,
+                                               double *carry)
+{
+  if (input_samples <= 0) return 0;
+  if (speed < RECEIVER_SYNC_SPEED_MIN || speed > RECEIVER_SYNC_SPEED_MAX)
+    speed = 1.0;
+  double desired = (double)input_samples / speed + (carry ? *carry : 0.0);
+  int output = (int)(desired + 0.5);
+  if (output < 1) output = 1;
+  if (carry) *carry = desired - (double)output;
+  return output;
+}
+
+static inline void receiver_audio_output_clock_start(
+    receiver_audio_output_clock_t *clock, uint64_t anchor_ns,
+    uint32_t sample_rate)
+{
+  if (!clock) return;
+  clock->initialized = sample_rate > 0;
+  clock->anchor_ns = anchor_ns;
+  clock->samples = 0;
+  clock->sample_rate = sample_rate;
+}
+
+static inline uint64_t receiver_audio_output_clock_next_ns(
+    const receiver_audio_output_clock_t *clock)
+{
+  if (!clock || !clock->initialized || !clock->sample_rate) return 0;
+  uint64_t delta = (uint64_t)((long double)clock->samples *
+                              1000000000.0L / clock->sample_rate);
+  return delta > UINT64_MAX - clock->anchor_ns
+             ? UINT64_MAX : clock->anchor_ns + delta;
+}
+
+static inline void receiver_audio_output_clock_advance(
+    receiver_audio_output_clock_t *clock, uint32_t output_samples)
+{
+  if (clock && clock->initialized &&
+      output_samples <= UINT64_MAX - clock->samples)
+    clock->samples += output_samples;
+}
+
 static inline uint64_t receiver_add_playout_latency_ns(uint64_t timestamp_ns,
                                                         uint64_t latency_ns)
 {

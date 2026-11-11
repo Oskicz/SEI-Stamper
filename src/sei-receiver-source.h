@@ -74,7 +74,9 @@ typedef struct sei_receiver_source {
   uint64_t last_video_output_mono_ns;
   bool video_output_cleared;
   uint64_t smoothed_input_latency_ns;
-  receiver_playout_delay_control_t playout_delay_control;
+  receiver_audio_output_clock_t audio_output_clock;
+  double audio_playout_speed;
+  double audio_speed_fractional_carry;
 
   /* Video decode */
   void *format_context;       /* FFmpeg format context (demux) */

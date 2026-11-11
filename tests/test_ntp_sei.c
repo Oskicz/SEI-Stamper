@@ -763,6 +763,80 @@ static void test_playout_delay_updates_are_stable(void) {
   ASSERT_TRUE(applied == 1310000000ULL, "stable target becomes active");
 }
 
+
+static void test_group_delay_speed_curve(void)
+{
+  printf("  adaptive group speed is bounded by skew...\n");
+  double small = receiver_sync_speed_for_skew_ns(200000000LL);
+  double large = receiver_sync_speed_for_skew_ns(1500000000LL);
+  double negative = receiver_sync_speed_for_skew_ns(-1500000000LL);
+  ASSERT_TRUE(small > 1.0 && small <= 1.05,
+              "moderate skew stays at or below 5 percent speed-up");
+  ASSERT_TRUE(large <= 1.15 && large > 1.14,
+              "large skew reaches but does not exceed 15 percent speed-up");
+  ASSERT_TRUE(negative >= 0.85 && negative < 0.86,
+              "large opposite skew reaches but does not exceed 15 percent slow-down");
+}
+
+static void test_group_delay_slews_without_jumps(void)
+{
+  printf("  group delay slews through reconnect gaps without timestamp jumps...\n");
+  receiver_group_delay_control_t control = {0};
+  double speed = 1.0;
+  uint64_t now = 1000000000ULL;
+  uint64_t applied = receiver_group_delay_step(
+      &control, 1500000000ULL, now, &speed);
+  ASSERT_EQ(applied, 1500000000ULL,
+            "first valid group target initializes the playout clock");
+  for (int i = 0; i < 100; ++i) {
+    now += 100000000ULL;
+    uint64_t previous = applied;
+    applied = receiver_group_delay_step(&control, 0, now, &speed);
+    uint64_t change = previous > applied ? previous - applied : applied - previous;
+    ASSERT_TRUE(change <= 15000001ULL,
+                "100 ms step never changes the group delay by more than 15 ms");
+    ASSERT_TRUE(speed >= 1.0 && speed <= 1.15,
+                "catch-up speed remains inside the configured cap");
+  }
+  ASSERT_TRUE(applied < 1000000000ULL,
+              "persistent stale peer is caught up gradually without a single jump");
+
+  receiver_group_delay_control_t fill_control = {0};
+  double fill_speed = 1.0;
+  uint64_t fill_now = 1000000000ULL;
+  uint64_t fill = receiver_group_delay_step(
+      &fill_control, 0, fill_now, &fill_speed);
+  for (int i = 0; i < 20; ++i) {
+    fill_now += 100000000ULL;
+    uint64_t previous = fill;
+    fill = receiver_group_delay_step(&fill_control, 1500000000ULL,
+                                     fill_now, &fill_speed);
+    uint64_t change = fill > previous ? fill - previous : previous - fill;
+    ASSERT_TRUE(change <= 17650001ULL,
+                "buffer growth follows the 15 percent slow-down without a jump");
+    ASSERT_TRUE(fill_speed >= 0.85 && fill_speed <= 1.0,
+                "buffer growth slows media within the configured cap");
+  }
+}
+
+static void test_audio_output_clock_and_slowdown_capacity(void)
+{
+  printf("  sample clock stays continuous and slow-down fits allocated audio...\n");
+  receiver_audio_output_clock_t clock = {0};
+  receiver_audio_output_clock_start(&clock, 5000000000ULL, 48000);
+  ASSERT_EQ(receiver_audio_output_clock_next_ns(&clock), 5000000000ULL,
+            "sample clock begins at the shared playout anchor");
+  receiver_audio_output_clock_advance(&clock, 1024);
+  ASSERT_EQ(receiver_audio_output_clock_next_ns(&clock), 5021333333ULL,
+            "sample count advances the audio timestamp continuously");
+  double carry = 0.0;
+  int slowed_samples = receiver_sync_output_samples(1024, 0.85, &carry);
+  ASSERT_TRUE(slowed_samples <= 1024 + 1024 / 5 + 32,
+              "15 percent slowdown fits in the resampler output allocation");
+  ASSERT_TRUE(slowed_samples > 1024,
+              "slowdown adds interpolated samples instead of truncating audio");
+}
+
 /* ─── Main ─────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -833,6 +907,9 @@ int main(void) {
   test_audio_decoder_recovery_threshold();
   test_playout_timestamps_use_common_latency();
   test_playout_delay_updates_are_stable();
+  test_group_delay_speed_curve();
+  test_group_delay_slews_without_jumps();
+  test_audio_output_clock_and_slowdown_capacity();
   test_ntp_sanity_check();
 
   printf("\n[SEI payload]\n");

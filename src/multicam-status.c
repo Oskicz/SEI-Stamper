@@ -1,4 +1,6 @@
 #include "multicam-status.h"
+#include "receiver-time.h"
+#include "receiver-time.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +19,7 @@ typedef struct status_slot {
 
 static pthread_mutex_t status_lock = PTHREAD_MUTEX_INITIALIZER;
 static status_slot_t slots[MULTICAM_STATUS_MAX_SOURCES];
+static receiver_group_delay_control_t group_delay_control;
 
 static status_slot_t *find_slot(void *key)
 {
@@ -49,6 +52,11 @@ void multicam_status_unregister(void *key)
   pthread_mutex_lock(&status_lock);
   status_slot_t *slot = find_slot(key);
   if (slot) memset(slot, 0, sizeof(*slot));
+  bool any_registered = false;
+  for (size_t i = 0; i < MULTICAM_STATUS_MAX_SOURCES; ++i)
+    any_registered = any_registered || slots[i].key != NULL;
+  if (!any_registered)
+    group_delay_control = (receiver_group_delay_control_t){0};
   pthread_mutex_unlock(&status_lock);
 }
 
@@ -80,6 +88,12 @@ void multicam_status_set_connection(void *key, bool connected,
       memset(slot->bitrate_samples, 0, sizeof(slot->bitrate_samples));
       slot->bitrate_sample_count = 0;
       slot->bitrate_sample_next = 0;
+      bool any_connected = false;
+      for (size_t i = 0; i < MULTICAM_STATUS_MAX_SOURCES; ++i)
+        any_connected = any_connected ||
+                        (slots[i].key && slots[i].value.connected);
+      if (!any_connected)
+        group_delay_control = (receiver_group_delay_control_t){0};
     }
   }
   pthread_mutex_unlock(&status_lock);
@@ -301,6 +315,39 @@ uint64_t multicam_status_group_max_latency_ns(uint64_t now_ns)
   pthread_mutex_unlock(&status_lock);
   return maximum;
 }
+
+
+uint64_t multicam_status_group_playout_latency_ns(uint64_t now_ns,
+                                                   double *playout_speed)
+{
+  uint64_t target_ns = 0;
+  bool any_audio = false;
+  pthread_mutex_lock(&status_lock);
+  for (size_t i = 0; i < MULTICAM_STATUS_MAX_SOURCES; ++i) {
+    const multicam_source_status_t *s = &slots[i].value;
+    if (!slots[i].key || !s->connected)
+      continue;
+    if (s->has_audio)
+      any_audio = true;
+    if (s->ntp_fresh &&
+        (s->sync_method == MULTICAM_SYNC_SEI_STAMPER_NTP ||
+         s->sync_method == MULTICAM_SYNC_MOBLIN_TIMECODE) &&
+        is_recent(s->last_video_mono_ns, now_ns) &&
+        s->sync_latency_ns > target_ns)
+      target_ns = s->sync_latency_ns;
+  }
+  if (any_audio)
+    target_ns = receiver_add_playout_latency_ns(
+        target_ns, RECEIVER_AUDIO_JITTER_CUSHION_NS);
+  if (target_ns > 2000000000ULL)
+    target_ns = 2000000000ULL;
+  uint64_t applied_ns = receiver_group_delay_step(
+      &group_delay_control, target_ns, now_ns, playout_speed);
+  pthread_mutex_unlock(&status_lock);
+  return applied_ns;
+}
+
+
 
 void multicam_status_set_playout_delay(void *key, uint64_t delay_ns)
 {

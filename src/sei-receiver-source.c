@@ -409,19 +409,6 @@ static int interrupt_if_video_stale(void *opaque)
   return 0;
 }
 
-/* Keep playout delay in timestamps, not an OBS async-delay filter.
- * libobs buffers OBS_SOURCE_ASYNC_VIDEO frames by timestamp and synchronizes
- * source audio to that video. Updating async-delay settings clears its queue,
- * which caused visible stalls whenever measured network age changed. */
-static void schedule_playout_delay(sei_receiver_source_t *source,
-                                  uint64_t delay_ns, bool force)
-{
-  UNUSED_PARAMETER(delay_ns);
-  UNUSED_PARAMETER(force);
-  if (source)
-    multicam_status_set_playout_delay(source, 0);
-}
-
 typedef struct managed_filter_list {
   obs_source_t **filters;
   size_t count;
@@ -634,6 +621,8 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     source->pts_offset = 0;
     source->audio_pts_offset_ns = 0;
     source->audio_pts_offset_valid = false;
+    source->audio_output_clock.initialized = false;
+    source->audio_speed_fractional_carry = 0.0;
     source->last_audio_pts_ns = 0;
     source->last_audio_pts_mono_ns = 0;
     source->last_video_capture_time_ns = 0;
@@ -835,7 +824,6 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                         observed_latency_ns,
                         frame_out->width, frame_out->height, source->pts_offset,
                         status_now_ns);
-  uint64_t group_playout_latency_ns = 0;
   if (ntp_fresh && absolute_unix_ns > 0) {
     source->last_video_capture_time_ns = capture_display_time;
     source->last_video_capture_mono_ns = status_now_ns;
@@ -876,24 +864,30 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                                      source->smoothed_input_latency_ns);
     uint64_t group_max_latency =
         multicam_status_group_max_latency_ns(status_now_ns);
-    group_playout_latency_ns = group_max_latency;
-    schedule_playout_delay(
+    multicam_status_set_playout_delay(
         source, multicam_status_playout_delay(group_max_latency,
-                                              source->smoothed_input_latency_ns),
-        false);
+                                              source->smoothed_input_latency_ns));
   }
 
-  /* The shared group latency is added to each NTP-mapped timestamp.
-   * OBS buffers future async-video frames by timestamp, and automatically
-   * synchronizes this source's audio to that video. No external delay filter
-   * is needed; changing one clears its frame queue and creates a visible stall. */
+  /* The shared delay state changes at a bounded rate. This avoids timestamp
+   * jumps when a peer stops sending frames and returns after a low-bitrate or
+   * LLB interval. OBS buffers future frames by timestamp and syncs audio to
+   * the same source clock. */
+  double group_playout_speed = 1.0;
+  uint64_t group_playout_latency_ns =
+      multicam_status_group_playout_latency_ns(status_now_ns,
+                                                &group_playout_speed);
+  source->audio_playout_speed = group_playout_speed;
   obs_frame.timestamp = receiver_add_playout_latency_ns(
       obs_frame.timestamp, group_playout_latency_ns);
 
   /* Debug log: confirm the timestamp */
   receiver_log(
-      LOG_DEBUG, source, "Video Decoded: %dx%d, PTS_IN=%lld, TS_OUT=%lld",
-      obs_frame.width, obs_frame.height, packet->pts, obs_frame.timestamp);
+      LOG_DEBUG, source,
+      "Video Decoded: %dx%d, PTS_IN=%lld, TS_OUT=%lld, group_delay=%llu ms, speed=%.3f",
+      obs_frame.width, obs_frame.height, packet->pts, obs_frame.timestamp,
+      (unsigned long long)(group_playout_latency_ns / 1000000ULL),
+      group_playout_speed);
 
   /* Push the frame to OBS */
   obs_source_output_video(source->context, &obs_frame);
@@ -1075,6 +1069,13 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       continue;
     }
 
+    uint64_t audio_now_ns = os_gettime_ns();
+    double group_playout_speed = 1.0;
+    uint64_t group_playout_latency_ns =
+        multicam_status_group_playout_latency_ns(audio_now_ns,
+                                                  &group_playout_speed);
+    source->audio_playout_speed = group_playout_speed;
+
     /* The decoder can return packed or planar samples in multiple formats.
      * Always convert into the declared OBS format (float planar) so the data
      * layout and sample type agree with audio.format. */
@@ -1120,10 +1121,26 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       }
     }
 
+    int requested_output_samples = receiver_sync_output_samples(
+        frame->nb_samples, group_playout_speed,
+        &source->audio_speed_fractional_carry);
+    ret = swr_set_compensation(resampler,
+                               requested_output_samples - frame->nb_samples,
+                               frame->nb_samples);
+    if (ret < 0) {
+      receiver_log(LOG_WARNING, source,
+                   "Could not apply bounded audio speed correction: %d", ret);
+      source->audio_speed_fractional_carry = 0.0;
+      swr_set_compensation(resampler, 0, frame->nb_samples);
+    }
+
+    /* Leave headroom for the full 15% slow-down plus SWR's small delay. */
+    int max_converted_samples =
+        frame->nb_samples + frame->nb_samples / 5 + 32;
     uint8_t **converted = NULL;
     int converted_line_size = 0;
     ret = av_samples_alloc_array_and_samples(&converted, &converted_line_size,
-                                              channels, frame->nb_samples,
+                                              channels, max_converted_samples,
                                               AV_SAMPLE_FMT_FLTP, 0);
     if (ret < 0) {
       receiver_log(LOG_ERROR, source, "Failed to allocate converted audio: %d", ret);
@@ -1132,7 +1149,8 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       av_frame_unref(frame);
       break;
     }
-    int converted_samples = swr_convert(resampler, converted, frame->nb_samples,
+    int converted_samples = swr_convert(resampler, converted,
+                                         max_converted_samples,
                                          (const uint8_t **)frame->extended_data,
                                          frame->nb_samples);
     if (converted_samples < 0) {
@@ -1184,7 +1202,6 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
                                       (int64_t)os_gettime_ns();
     }
 
-    uint64_t audio_now_ns = os_gettime_ns();
     if (pts != AV_NOPTS_VALUE) {
       if (source->last_audio_pts_mono_ns &&
           receiver_pts_has_backward_reset(source->last_audio_pts_ns, pts_ns,
@@ -1192,6 +1209,8 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
         receiver_log(LOG_WARNING, source,
                      "Audio PTS moved backwards; recalibrating audio clock to video");
         source->audio_pts_offset_valid = false;
+        source->audio_output_clock.initialized = false;
+        source->audio_speed_fractional_carry = 0.0;
       }
       source->last_audio_pts_ns = pts_ns;
       source->last_audio_pts_mono_ns = audio_now_ns;
@@ -1229,23 +1248,28 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
     }
     uint64_t scheduled_audio_time = receiver_audio_timestamp_with_offset(
         capture_audio_time, 0);
-    bool absolute_audio_clock = source->absolute_sync_method != SYNC_METHOD_UNKNOWN &&
-        source->ntp_enabled && !ntp_client_needs_resync(
-            &source->ntp_client,
-            receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
-    if (absolute_audio_clock) {
-      uint64_t group_latency =
-          multicam_status_group_max_latency_ns(os_gettime_ns());
-      scheduled_audio_time = receiver_add_playout_latency_ns(
-          scheduled_audio_time, group_latency);
+    scheduled_audio_time = receiver_add_playout_latency_ns(
+        scheduled_audio_time, group_playout_latency_ns);
+    if (!source->audio_output_clock.initialized ||
+        source->audio_output_clock.sample_rate != (uint32_t)frame->sample_rate) {
+      receiver_audio_output_clock_start(&source->audio_output_clock,
+                                        scheduled_audio_time,
+                                        (uint32_t)frame->sample_rate);
+      source->audio_speed_fractional_carry = 0.0;
     }
-    int64_t scheduled_audio_time_signed =
-        scheduled_audio_time > (uint64_t)INT64_MAX
-            ? INT64_MAX : (int64_t)scheduled_audio_time;
+    uint64_t audio_clock_next =
+        receiver_audio_output_clock_next_ns(&source->audio_output_clock);
+    int64_t audio_clock_signed =
+        audio_clock_next > (uint64_t)INT64_MAX
+            ? INT64_MAX : (int64_t)audio_clock_next;
     audio.timestamp = receiver_audio_timestamp_with_offset(
-        scheduled_audio_time_signed, audio_offset_ns);
+        audio_clock_signed, audio_offset_ns);
 
-    obs_source_output_audio(source->context, &audio);
+    if (converted_samples > 0) {
+      receiver_audio_output_clock_advance(
+          &source->audio_output_clock, (uint32_t)converted_samples);
+      obs_source_output_audio(source->context, &audio);
+    }
     multicam_status_audio(source, audio_now_ns);
     av_freep(&converted[0]);
     av_freep(&converted);
@@ -1284,6 +1308,7 @@ static void *receiver_source_create(obs_data_t *settings,
   ctx->reset_picture_requested = false;
   ctx->last_video_pts_ns = AV_NOPTS_VALUE;
   ctx->video_output_cleared = true;
+  ctx->audio_playout_speed = 1.0;
 
   /* Initialise the frame buffer */
   if (!frame_buffer_init(&ctx->frame_buffer)) {
@@ -1705,13 +1730,16 @@ static void cleanup_connection(sei_receiver_source_t *source) {
   source->smoothed_input_latency_ns = 0;
   source->audio_pts_offset_ns = 0;
   source->audio_pts_offset_valid = false;
+  source->audio_output_clock.initialized = false;
+  source->audio_playout_speed = 1.0;
+  source->audio_speed_fractional_carry = 0.0;
   source->last_audio_pts_ns = 0;
   source->last_audio_pts_mono_ns = 0;
   source->last_video_capture_time_ns = 0;
   source->last_video_capture_mono_ns = 0;
   source->audio_waiting_for_anchor_since_ns = 0;
   multicam_status_set_sync_latency(source, 0);
-  schedule_playout_delay(source, 0, true);
+  multicam_status_set_playout_delay(source, 0);
   multicam_status_set_connection(source, false, NULL, false, 0, 0);
   receiver_log(LOG_INFO, source, "Connection closed and resources freed");
 }
@@ -1933,13 +1961,16 @@ static void *srt_receive_thread(void *data) {
       source->smoothed_input_latency_ns = 0;
       source->audio_pts_offset_ns = 0;
       source->audio_pts_offset_valid = false;
+      source->audio_output_clock.initialized = false;
+      source->audio_playout_speed = 1.0;
+      source->audio_speed_fractional_carry = 0.0;
       source->last_audio_pts_ns = 0;
       source->last_audio_pts_mono_ns = 0;
       source->last_video_capture_time_ns = 0;
       source->last_video_capture_mono_ns = 0;
       source->audio_waiting_for_anchor_since_ns = 0;
       multicam_status_set_sync_latency(source, 0);
-      schedule_playout_delay(source, 0, true);
+      multicam_status_set_playout_delay(source, 0);
       receiver_log(LOG_INFO, source,
                    "Synchronization reset requested; waiting for a fresh absolute timestamp");
     }
