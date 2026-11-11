@@ -6,16 +6,25 @@
 ******************************************************************************/
 
 #include "sei-receiver-source.h"
+#include "receiver-time.h"
+#include "moblin-timecode.h"
+#include "multicam-status.h"
+#include "receiver-diagnostics.h"
 #include <media-io/video-io.h>
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/threading.h>
+
+#include <stdio.h>
+#include <string.h>
 
 /* FFmpeg Headers */
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
 /* SRT Headers */
@@ -32,6 +41,198 @@
 
 /* SRT receive buffer size */
 #define SRT_BUFFER_SIZE (1024 * 1024) /* 1MB */
+#define VIDEO_STALE_TIMEOUT_NS 2000000000ULL
+#define PTS_BACKWARD_RESET_NS 500000000ULL
+#define MAX_SYNC_PLAYOUT_DELAY_NS 2000000000ULL
+#define RECEIVER_DIAGNOSTICS_INTERVAL_NS 10000000000ULL
+#define RECEIVER_DIAGNOSTICS_MAX_BYTES (1024U * 1024U)
+#define RECEIVER_DIAGNOSTICS_BACKUPS 2U
+
+static pthread_mutex_t receiver_diagnostics_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *receiver_diagnostics_path;
+static uint64_t receiver_diagnostics_next_source_id = 1;
+static bool receiver_diagnostics_warned;
+
+void sei_receiver_diagnostics_init(void)
+{
+  pthread_mutex_lock(&receiver_diagnostics_lock);
+  if (!receiver_diagnostics_path) {
+    char *path = obs_module_config_path("multicam-diagnostics.jsonl");
+    if (path) {
+      char *directory = bstrdup(path);
+      if (directory) {
+        char *slash = strrchr(directory, '/');
+        char *backslash = strrchr(directory, '\\');
+        if (!slash || (backslash && backslash > slash))
+          slash = backslash;
+        if (slash) {
+          *slash = '\0';
+          os_mkdirs(directory);
+        }
+        bfree(directory);
+      }
+      receiver_diagnostics_path = path;
+      blog(LOG_INFO, "[SEI Receiver] Bounded diagnostics: %s (1 MiB + 2 backups)", path);
+    } else {
+      blog(LOG_WARNING, "[SEI Receiver] Could not resolve diagnostics path");
+    }
+  }
+  pthread_mutex_unlock(&receiver_diagnostics_lock);
+}
+
+void sei_receiver_diagnostics_shutdown(void)
+{
+  pthread_mutex_lock(&receiver_diagnostics_lock);
+  bfree(receiver_diagnostics_path);
+  receiver_diagnostics_path = NULL;
+  pthread_mutex_unlock(&receiver_diagnostics_lock);
+}
+
+static uint64_t receiver_diagnostics_assign_source_id(void)
+{
+  pthread_mutex_lock(&receiver_diagnostics_lock);
+  uint64_t id = receiver_diagnostics_next_source_id++;
+  if (receiver_diagnostics_next_source_id == 0)
+    receiver_diagnostics_next_source_id = 1;
+  pthread_mutex_unlock(&receiver_diagnostics_lock);
+  return id;
+}
+
+static bool receiver_diagnostics_interval_due(uint64_t last_ns, uint64_t now_ns)
+{
+  return !last_ns || now_ns < last_ns ||
+         now_ns - last_ns >= RECEIVER_DIAGNOSTICS_INTERVAL_NS;
+}
+
+static void receiver_diagnostics_write(sei_receiver_source_t *source,
+                                      const char *json_line)
+{
+  if (!source || !json_line)
+    return;
+  pthread_mutex_lock(&receiver_diagnostics_lock);
+  bool written = receiver_diagnostics_path &&
+      receiver_diagnostics_append(receiver_diagnostics_path, json_line,
+                                  RECEIVER_DIAGNOSTICS_MAX_BYTES,
+                                  RECEIVER_DIAGNOSTICS_BACKUPS);
+  bool warn = !written && !receiver_diagnostics_warned;
+  if (warn)
+    receiver_diagnostics_warned = true;
+  pthread_mutex_unlock(&receiver_diagnostics_lock);
+  if (warn)
+    receiver_log(LOG_WARNING, source,
+                 "Could not append bounded receiver diagnostics; streaming continues");
+}
+
+static void receiver_diagnostics_video_sample(
+    sei_receiver_source_t *source, uint64_t now_ns, int64_t input_pts_ns,
+    uint64_t output_pts_ns, bool ntp_fresh, uint64_t group_delay_ns,
+    double speed)
+{
+  if (!source || !receiver_diagnostics_interval_due(
+                     source->last_video_diagnostics_mono_ns, now_ns))
+    return;
+  source->last_video_diagnostics_mono_ns = now_ns;
+  double output_lead_ms = ((double)output_pts_ns - (double)now_ns) / 1000000.0;
+  char line[512];
+  snprintf(line, sizeof(line),
+      "{\"kind\":\"video\",\"source_id\":%llu,\"mono_ns\":%llu,\"sync_method\":%d,\"ntp_fresh\":%s,\"input_pts_ns\":%lld,\"output_pts_ns\":%llu,\"output_lead_ms\":%.3f,\"input_latency_ms\":%.3f,\"source_wait_ms\":%.3f,\"group_delay_ms\":%.3f,\"speed\":%.5f,\"fps\":%.3f,\"rx_bitrate_bps\":%llu,\"decode_errors\":%llu,\"pts_resets\":%llu}\n",
+      (unsigned long long)source->diagnostic_source_id,
+      (unsigned long long)now_ns, (int)source->sync_method,
+      ntp_fresh ? "true" : "false", (long long)input_pts_ns,
+      (unsigned long long)output_pts_ns, output_lead_ms,
+      (double)source->smoothed_input_latency_ns / 1000000.0,
+      (double)((group_delay_ns > source->smoothed_input_latency_ns &&
+                (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP ||
+                 source->sync_method == SYNC_METHOD_MOBLIN_TIMECODE))
+                   ? group_delay_ns - source->smoothed_input_latency_ns : 0) /
+          1000000.0,
+      (double)group_delay_ns / 1000000.0, speed,
+      (double)source->current_fps,
+      (unsigned long long)source->rx_bitrate_bps,
+      (unsigned long long)source->decode_errors_total,
+      (unsigned long long)source->video_pts_resets);
+  receiver_diagnostics_write(source, line);
+}
+
+static void receiver_diagnostics_audio_sample(
+    sei_receiver_source_t *source, uint64_t now_ns, int input_format,
+    int output_format, int input_samples, int output_samples,
+    uint64_t output_pts_ns, uint64_t group_delay_ns, double speed)
+{
+  if (!source || !receiver_diagnostics_interval_due(
+                     source->last_audio_diagnostics_mono_ns, now_ns))
+    return;
+  source->last_audio_diagnostics_mono_ns = now_ns;
+  double output_lead_ms = ((double)output_pts_ns - (double)now_ns) / 1000000.0;
+  char line[512];
+  snprintf(line, sizeof(line),
+      "{\"kind\":\"audio\",\"source_id\":%llu,\"mono_ns\":%llu,\"input_sample_format\":%d,\"obs_sample_format\":%d,\"input_samples\":%d,\"output_samples\":%d,\"audio_timestamp_ns\":%llu,\"output_lead_ms\":%.3f,\"audio_anchor_offset_ms\":%.3f,\"group_delay_ms\":%.3f,\"speed\":%.5f,\"rx_bitrate_bps\":%llu,\"decode_errors\":%llu,\"pts_resets\":%llu,\"decoder_recoveries\":%llu}\n",
+      (unsigned long long)source->diagnostic_source_id,
+      (unsigned long long)now_ns, input_format, output_format,
+      input_samples, output_samples, (unsigned long long)output_pts_ns,
+      output_lead_ms, (double)source->audio_pts_offset_ns / 1000000.0,
+      (double)group_delay_ns / 1000000.0, speed,
+      (unsigned long long)source->rx_bitrate_bps,
+      (unsigned long long)source->audio_decode_errors_total,
+      (unsigned long long)source->audio_pts_resets,
+      (unsigned long long)source->audio_decoder_recoveries);
+  receiver_diagnostics_write(source, line);
+}
+
+static void receiver_diagnostics_event(sei_receiver_source_t *source,
+                                       uint64_t now_ns, const char *event,
+                                       int64_t previous_pts_ns,
+                                       int64_t current_pts_ns)
+{
+  if (!source || !event ||
+      (source->last_event_diagnostics_mono_ns &&
+       now_ns >= source->last_event_diagnostics_mono_ns &&
+       now_ns - source->last_event_diagnostics_mono_ns < 1000000000ULL))
+    return;
+  source->last_event_diagnostics_mono_ns = now_ns;
+  char line[384];
+  snprintf(line, sizeof(line),
+      "{\"kind\":\"event\",\"source_id\":%llu,\"mono_ns\":%llu,\"event\":\"%s\",\"previous_pts_ns\":%lld,\"current_pts_ns\":%lld}\n",
+      (unsigned long long)source->diagnostic_source_id,
+      (unsigned long long)now_ns, event,
+      (long long)previous_pts_ns, (long long)current_pts_ns);
+  receiver_diagnostics_write(source, line);
+}
+
+typedef struct receiver_context_node {
+  sei_receiver_source_t *context;
+  struct receiver_context_node *next;
+} receiver_context_node_t;
+
+static pthread_mutex_t receiver_contexts_lock = PTHREAD_MUTEX_INITIALIZER;
+static receiver_context_node_t *receiver_contexts;
+
+static void register_receiver_context(sei_receiver_source_t *context)
+{
+  receiver_context_node_t *node = bzalloc(sizeof(*node));
+  if (!node) return;
+  node->context = context;
+  pthread_mutex_lock(&receiver_contexts_lock);
+  node->next = receiver_contexts;
+  receiver_contexts = node;
+  pthread_mutex_unlock(&receiver_contexts_lock);
+}
+
+static void unregister_receiver_context(sei_receiver_source_t *context)
+{
+  pthread_mutex_lock(&receiver_contexts_lock);
+  receiver_context_node_t **link = &receiver_contexts;
+  while (*link) {
+    if ((*link)->context == context) {
+      receiver_context_node_t *removed = *link;
+      *link = removed->next;
+      bfree(removed);
+      break;
+    }
+    link = &(*link)->next;
+  }
+  pthread_mutex_unlock(&receiver_contexts_lock);
+}
 
 /*============================================================================
  * Frame buffer management
@@ -209,6 +410,7 @@ static bool reset_decoder(sei_receiver_source_t *source) {
 
     AVCodecContext *cctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(cctx, vstream->codecpar);
+    cctx->pkt_timebase = vstream->time_base;
 
     /* Reconfigure hardware decode */
     if (source->hw_decode_enabled && source->hw_device_ctx) {
@@ -294,6 +496,156 @@ static bool init_hw_device(sei_receiver_source_t *source) {
  *============================================================================*/
 
 /* Decode and extract the SEI */
+static void record_decode_error(sei_receiver_source_t *source)
+{
+  if (!source)
+    return;
+  source->decode_errors_total++;
+  multicam_status_set_decode_errors(source, source->decode_errors_total);
+}
+
+static void record_audio_decode_error(sei_receiver_source_t *source)
+{
+  if (!source)
+    return;
+  source->audio_decode_errors_total++;
+  if (source->audio_decode_error_streak < UINT32_MAX)
+    source->audio_decode_error_streak++;
+  multicam_status_set_audio_decode_errors(source,
+                                          source->audio_decode_errors_total);
+
+  uint64_t now_ns = os_gettime_ns();
+  if (!source->audio_codec_context ||
+      !receiver_audio_decoder_recovery_due(source->audio_decode_error_streak,
+                                           now_ns,
+                                           source->audio_decoder_last_flush_ns))
+    return;
+
+  avcodec_flush_buffers((AVCodecContext *)source->audio_codec_context);
+  if (source->audio_resampler) {
+    SwrContext *resampler = (SwrContext *)source->audio_resampler;
+    swr_free(&resampler);
+    source->audio_resampler = NULL;
+  }
+  av_channel_layout_uninit(&source->audio_resampler_layout);
+  source->audio_decoder_last_flush_ns = now_ns;
+  source->audio_decoder_recoveries++;
+  receiver_diagnostics_event(source, now_ns, "audio_decoder_recovery",
+                             AV_NOPTS_VALUE, AV_NOPTS_VALUE);
+  source->audio_decode_error_streak = 0;
+  receiver_log(LOG_WARNING, source,
+               "Audio decoder recovered after repeated decode errors");
+}
+
+static void clear_output_video(sei_receiver_source_t *source)
+{
+  if (!source || !source->context || source->video_output_cleared)
+    return;
+  obs_source_output_video(source->context, NULL);
+  source->video_output_cleared = true;
+  receiver_log(LOG_INFO, source,
+               "Cleared stale video output after 2 seconds without decoded frames");
+}
+
+static int interrupt_if_video_stale(void *opaque)
+{
+  sei_receiver_source_t *source = (sei_receiver_source_t *)opaque;
+  if (source) {
+    bool reset_requested;
+    pthread_mutex_lock(&source->audio_settings_lock);
+    reset_requested = source->reset_picture_requested;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+    if (reset_requested)
+      return 1;
+  }
+  if (!source || !source->thread_active || !source->last_video_output_mono_ns ||
+      source->video_output_cleared)
+    return 0;
+  uint64_t now = os_gettime_ns();
+  if (receiver_video_is_stale(source->last_video_output_mono_ns, now,
+                              VIDEO_STALE_TIMEOUT_NS)) {
+    clear_output_video(source);
+    return 1;
+  }
+  return 0;
+}
+
+typedef struct managed_filter_list {
+  obs_source_t **filters;
+  size_t count;
+  size_t capacity;
+} managed_filter_list_t;
+
+static bool collect_managed_playout_filter(obs_source_t *parent,
+                                           obs_source_t *filter,
+                                           void *opaque)
+{
+  UNUSED_PARAMETER(parent);
+  managed_filter_list_t *list = (managed_filter_list_t *)opaque;
+  const char *name = obs_source_get_name(filter);
+  const char *id = obs_source_get_id(filter);
+  if (!name || !id || strcmp(name, "SEI Sync Playout Delay") != 0 ||
+      strcmp(id, "async_delay_filter") != 0 || list->count >= list->capacity)
+    return true;
+  list->filters[list->count++] = obs_source_get_ref(filter);
+  return true;
+}
+
+void sei_receiver_cleanup_playout_filters(void)
+{
+  typedef struct cleanup_target {
+    sei_receiver_source_t *context;
+    obs_source_t *source;
+  } cleanup_target_t;
+
+  pthread_mutex_lock(&receiver_contexts_lock);
+  size_t count = 0;
+  for (receiver_context_node_t *node = receiver_contexts; node; node = node->next)
+    count++;
+  cleanup_target_t *targets = count ? bzalloc(count * sizeof(*targets)) : NULL;
+  size_t target_count = 0;
+  if (targets) {
+    for (receiver_context_node_t *node = receiver_contexts; node; node = node->next) {
+      obs_source_t *source = obs_source_get_ref(node->context->context);
+      if (source) {
+        targets[target_count].context = node->context;
+        targets[target_count].source = source;
+        target_count++;
+      }
+    }
+  }
+  pthread_mutex_unlock(&receiver_contexts_lock);
+
+  for (size_t i = 0; i < target_count; ++i) {
+    sei_receiver_source_t *context = targets[i].context;
+    obs_source_t *parent = targets[i].source;
+    size_t filter_count = obs_source_filter_count(parent);
+    obs_source_t **filters = filter_count
+        ? (obs_source_t **)bzalloc(filter_count * sizeof(*filters)) : NULL;
+    managed_filter_list_t list = {filters, 0, filters ? filter_count : 0};
+    if (filters) obs_source_enum_filters(parent, collect_managed_playout_filter, &list);
+    for (size_t j = 0; j < list.count; ++j) {
+      obs_source_filter_remove(parent, list.filters[j]);
+      obs_source_release(list.filters[j]);
+    }
+    if (filters) bfree(filters);
+
+    multicam_status_set_playout_delay(context, 0);
+    obs_source_release(parent);
+  }
+  if (targets) bfree(targets);
+}
+
+static void clear_if_video_stale(sei_receiver_source_t *source)
+{
+  if (!source || source->video_output_cleared ||
+      !source->last_video_output_mono_ns)
+    return;
+  if (receiver_video_is_stale(source->last_video_output_mono_ns,
+                              os_gettime_ns(), VIDEO_STALE_TIMEOUT_NS))
+    clear_output_video(source);
+}
+
 bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                             video_frame_data_t *frame_out) {
   if (!source || !packet || !frame_out) {
@@ -306,23 +658,18 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   }
 
   /* Send the packet to the decoder */
-  static uint64_t send_count = 0;
-  send_count++;
-
   int ret = avcodec_send_packet(codec_ctx, packet);
   if (ret < 0) {
     receiver_log(LOG_ERROR, source, "Failed to send packet to decoder: %d (%s)",
                  ret, av_err2str(ret));
+    record_decode_error(source);
     return false;
-  }
-
-  if (send_count % 30 == 1) {
-    receiver_log(LOG_INFO, source, "Packet sent to decoder: #%llu", send_count);
   }
 
   /* Receive the decoded frame */
   AVFrame *av_frame = av_frame_alloc();
   if (!av_frame) {
+    record_decode_error(source);
     return false;
   }
 
@@ -354,6 +701,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
 
     /* Error recovery: bump the error count */
     source->decode_error_count++;
+    record_decode_error(source);
     if (source->decode_error_count >= source->decode_error_threshold) {
       receiver_log(LOG_WARNING, source,
                    "Decoder error threshold reached (%u), attempting reset",
@@ -361,14 +709,6 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
       reset_decoder(source);
     }
     return false;
-  }
-
-  static uint64_t video_frame_count = 0;
-  video_frame_count++;
-  if (video_frame_count % 30 == 1) {
-    receiver_log(
-        LOG_INFO, source, "Video frame decoded: #%llu, format=%d, size=%dx%d",
-        video_frame_count, av_frame->format, av_frame->width, av_frame->height);
   }
 
   /* Decode succeeded; reset the error count */
@@ -395,25 +735,57 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     }
 
     sw_frame->pts = av_frame->pts;
+    sw_frame->best_effort_timestamp = av_frame->best_effort_timestamp;
     av_frame_free(&av_frame);
     av_frame = sw_frame;
   }
 
-  /* Take the PTS from the AVFrame (FFmpeg converted it from the packet) */
-  int64_t pts = av_frame->pts;
-  if (pts == AV_NOPTS_VALUE) {
-    /* With no PTS, use the current time */
-    pts = os_gettime_ns();
-  } else {
-    /* Convert the PTS from the stream timebase to nanoseconds */
-    AVRational time_base = {1, 90000}; // MPEG-TS normally uses 90 kHz
-    pts = av_rescale_q(pts, time_base, (AVRational){1, 1000000000});
+  /* AVFrame PTS retains the originating stream's time base. */
+  AVFormatContext *format_ctx = (AVFormatContext *)source->format_context;
+  AVRational video_time_base =
+      format_ctx->streams[source->video_stream_index]->time_base;
+  int64_t video_pts = av_frame->best_effort_timestamp;
+  if (video_pts == AV_NOPTS_VALUE)
+    video_pts = av_frame->pts;
+  if (video_pts == AV_NOPTS_VALUE)
+    video_pts = packet->pts;
+  int64_t pts_ns = video_pts;
+  if (pts_ns == AV_NOPTS_VALUE)
+    pts_ns = os_gettime_ns();
+  else
+    pts_ns = receiver_pts_to_ns(pts_ns, video_time_base.num,
+                                video_time_base.den);
+
+  /* A sender can switch to a new PTS origin without dropping the SRT link.
+   * Never apply the old camera's PTS-to-OBS mapping after a large rewind. */
+  if (source->last_video_pts_ns != AV_NOPTS_VALUE &&
+      receiver_pts_has_backward_reset(source->last_video_pts_ns, pts_ns,
+                                      PTS_BACKWARD_RESET_NS)) {
+    receiver_log(LOG_WARNING, source,
+                 "Video PTS moved backwards; resetting sync anchor");
+    source->video_pts_resets++;
+    receiver_diagnostics_event(source, os_gettime_ns(), "video_pts_reset",
+                               source->last_video_pts_ns, pts_ns);
+    source->has_pts_offset = false;
+    source->pts_offset = 0;
+    source->audio_pts_offset_ns = 0;
+    source->audio_pts_offset_valid = false;
+    source->audio_output_clock.initialized = false;
+    source->audio_speed_fractional_carry = 0.0;
+    source->last_audio_pts_ns = 0;
+    source->last_audio_pts_mono_ns = 0;
+    source->last_video_capture_time_ns = 0;
+    source->last_video_capture_mono_ns = 0;
+    source->audio_waiting_for_anchor_since_ns = 0;
+    source->sync_method = SYNC_METHOD_UNKNOWN;
+    source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
   }
+  source->last_video_pts_ns = pts_ns;
 
   /* Fill in the frame info */
   frame_out->width = av_frame->width;
   frame_out->height = av_frame->height;
-  frame_out->pts = av_frame->pts;
+  frame_out->pts = pts_ns;
   frame_out->format = VIDEO_FORMAT_I420; /* YUV420P by default */
 
   /* Compute the frame size and allocate (align 32 for OBS) */
@@ -460,6 +832,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
 
   /* Try to pull the SEI out of the side data */
   frame_out->has_ntp = false;
+  frame_out->timestamp_source = SYNC_METHOD_UNKNOWN;
 
   AVFrameSideData *sei_data =
       av_frame_get_side_data(av_frame, AV_FRAME_DATA_SEI_UNREGISTERED);
@@ -470,14 +843,16 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     if (parse_ntp_sei(sei_data->data, sei_data->size, &ntp_data)) {
       frame_out->ntp_time = ntp_data.ntp_time;
       frame_out->has_ntp = true;
+      frame_out->timestamp_source = SYNC_METHOD_SEI_STAMPER_NTP;
       source->sei_found_count++;
 
       receiver_log(LOG_DEBUG, source,
                    "Extracted NTP SEI: seconds=%u, fraction=%u",
                    ntp_data.ntp_time.seconds, ntp_data.ntp_time.fraction);
     }
-  } else {
-    /* If the side data has none, look in the raw data */
+  }
+  if (!frame_out->has_ntp) {
+    /* FFmpeg does not expose HEVC time_code as unregistered user data. */
     const uint8_t *payload = NULL;
     size_t payload_size = 0;
 
@@ -487,81 +862,50 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
       if (parse_ntp_sei(payload, payload_size, &ntp_data)) {
         frame_out->ntp_time = ntp_data.ntp_time;
         frame_out->has_ntp = true;
+        frame_out->timestamp_source = SYNC_METHOD_SEI_STAMPER_NTP;
         source->sei_found_count++;
       }
     }
   }
 
-  /* NTP sync policy:
-   * 1. Sync on a keyframe (IDR) that carries an SEI timestamp
-   * 2. Sync when local time differs from NTP time by over 50 ms
-   */
-  if (frame_out->has_ntp && source->ntp_enabled) {
-    bool should_sync = false;
-    uint64_t now = os_gettime_ns();
-
-    /* Condition 1: keyframe sync, with a 10 s minimum gap */
-    bool is_keyframe = (av_frame->flags & AV_FRAME_FLAG_KEY) != 0;
-
-    /* Time since the last sync*/
-    uint64_t time_since_last_sync = 0;
-    if (source->last_ntp_sync_time > 0) {
-      time_since_last_sync = now - source->last_ntp_sync_time;
-    }
-
-    /* Use the configured minimum sync interval */
-    uint64_t min_interval_ns =
-        (uint64_t)source->ntp_sync_interval_ms * 1000000ULL;
-
-    if (is_keyframe && time_since_last_sync >= min_interval_ns) {
-      should_sync = true;
-      receiver_log(LOG_DEBUG, source,
-                   "Keyframe + interval met, triggering NTP sync");
-    }
-
-    /* Condition 2: drift detection, also bounded by the minimum gap */
-    if (!should_sync && source->ntp_client.is_synced &&
-        time_since_last_sync >= min_interval_ns) {
-      /* Nanoseconds for this frame's NTP timestamp */
-      uint64_t frame_ntp_ns =
-          ((uint64_t)frame_out->ntp_time.seconds * 1000000000ULL) +
-          (((uint64_t)frame_out->ntp_time.fraction * 1000000000ULL) >> 32);
-
-      /* NTP time for the current local time */
+  if (!frame_out->has_ntp && source->ntp_enabled) {
+    AVFormatContext *format_ctx = (AVFormatContext *)source->format_context;
+    moblin_timecode_t moblin_tc;
+    if (!frame_out->has_ntp && source->ntp_enabled && format_ctx &&
+        source->video_stream_index >= 0 &&
+        codec_ctx->codec_id == AV_CODEC_ID_HEVC &&
+        moblin_extract_timecode_annexb(packet->data, packet->size,
+                                       &moblin_tc)) {
       ntp_timestamp_t current_ntp;
-      if (ntp_client_get_time(&source->ntp_client, &current_ntp)) {
-        uint64_t current_ntp_ns =
-            ((uint64_t)current_ntp.seconds * 1000000000ULL) +
-            (((uint64_t)current_ntp.fraction * 1000000000ULL) >> 32);
-
-        /* Compute the difference */
-        int64_t time_diff = (int64_t)(frame_ntp_ns - current_ntp_ns);
-        if (time_diff < 0)
-          time_diff = -time_diff; // absolute value
-
-        /* Use the configured drift threshold */
-        uint64_t drift_threshold_ns =
-            (uint64_t)source->ntp_drift_threshold_ms * 1000000ULL;
-        if (time_diff > (int64_t)drift_threshold_ns) {
-          should_sync = true;
-          receiver_log(LOG_DEBUG, source,
-                       "Time drift detected: %lld ms, triggering NTP sync",
-                       time_diff / 1000000);
-        }
-      }
-    }
-
-    /* Perform the NTP sync */
-    if (should_sync) {
-      /* Update the time either way: a network fault must not retry every frame
-       */
-      source->last_ntp_sync_time = now;
-
-      if (ntp_client_sync(&source->ntp_client)) {
-        receiver_log(LOG_INFO, source, "NTP synchronized (syncs: %u)",
-                     source->ntp_client.sync_count);
-      } else {
-        receiver_log(LOG_WARNING, source, "NTP sync failed");
+      int64_t current_unix_ns, mapped_unix_ns;
+      AVStream *stream = format_ctx->streams[source->video_stream_index];
+      AVRational fps = {0, 1};
+      moblin_select_timecode_rate(stream->r_frame_rate.num,
+                                  stream->r_frame_rate.den,
+                                  stream->avg_frame_rate.num,
+                                  stream->avg_frame_rate.den, &fps.num,
+                                  &fps.den);
+      /* A fresh local NTP anchor supplies the missing calendar date. With no
+       * trustworthy anchor or frame rate, retain the explicit PTS fallback. */
+      uint32_t ntp_max_age =
+          receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms);
+      if (!ntp_client_needs_resync(&source->ntp_client, ntp_max_age) &&
+          ntp_client_get_time(&source->ntp_client, &current_ntp) &&
+          receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
+                                  &current_unix_ns) &&
+          moblin_timecode_resolve_unix_ns(&moblin_tc, current_unix_ns,
+                                          fps.num, fps.den,
+                                          &mapped_unix_ns)) {
+        uint64_t unix_seconds = (uint64_t)(mapped_unix_ns / 1000000000LL);
+        uint64_t fraction_ns = (uint64_t)(mapped_unix_ns % 1000000000LL);
+        frame_out->ntp_time.seconds =
+            (uint32_t)(unix_seconds + 2208988800ULL);
+        frame_out->ntp_time.fraction =
+            (uint32_t)((fraction_ns << 32) / 1000000000ULL);
+        frame_out->has_ntp = true;
+        frame_out->timestamp_source = SYNC_METHOD_MOBLIN_TIMECODE;
+        source->sync_method = SYNC_METHOD_MOBLIN_TIMECODE;
+        source->sei_found_count++;
       }
     }
   }
@@ -577,15 +921,127 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   obs_frame.format = VIDEO_FORMAT_BGRA;
 
   /* Calculate correct Sync Timestamp */
-  obs_frame.timestamp = calculate_display_time(source, frame_out);
+  if (frame_out->has_ntp)
+    source->sync_method = frame_out->timestamp_source;
+  int64_t capture_display_time = calculate_display_time(source, frame_out);
+  obs_frame.timestamp = capture_display_time > 0
+                            ? (uint64_t)capture_display_time : 0;
 
-  /* Debug log: confirm the timestamp */
-  receiver_log(
-      LOG_DEBUG, source, "Video Decoded: %dx%d, PTS_IN=%lld, TS_OUT=%lld",
-      obs_frame.width, obs_frame.height, packet->pts, obs_frame.timestamp);
+  int64_t absolute_unix_ns = 0;
+  int64_t current_unix_ns = 0;
+  uint64_t observed_latency_ns = 0;
+  uint64_t status_now_ns = os_gettime_ns();
+  bool ntp_fresh = false;
+  multicam_status_sync_method_t status_method = MULTICAM_SYNC_PTS_FALLBACK;
+  if (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP)
+    status_method = MULTICAM_SYNC_SEI_STAMPER_NTP;
+  else if (source->sync_method == SYNC_METHOD_MOBLIN_TIMECODE)
+    status_method = MULTICAM_SYNC_MOBLIN_TIMECODE;
+  if (status_method == MULTICAM_SYNC_SEI_STAMPER_NTP ||
+      status_method == MULTICAM_SYNC_MOBLIN_TIMECODE) {
+    ntp_fresh = !ntp_client_needs_resync(
+        &source->ntp_client,
+        receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
+    if (ntp_fresh) {
+      ntp_timestamp_t current_ntp;
+      bool have_current_time =
+          ntp_client_get_time(&source->ntp_client, &current_ntp) &&
+          receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
+                                  &current_unix_ns);
+      if (frame_out->has_ntp &&
+          receiver_ntp_to_unix_ns(frame_out->ntp_time.seconds,
+                                  frame_out->ntp_time.fraction,
+                                  &absolute_unix_ns)) {
+        /* Current frame has an absolute timestamp. */
+      } else {
+        if (have_current_time &&
+            receiver_monotonic_to_unix_ns((int64_t)obs_frame.timestamp,
+                                          (int64_t)status_now_ns,
+                                          current_unix_ns,
+                                          &absolute_unix_ns)) {
+          /* Project this PTS-only frame through the fresh NTP anchor. */
+        } else {
+          ntp_fresh = false;
+        }
+      }
+      if (ntp_fresh && have_current_time && absolute_unix_ns > 0 &&
+          current_unix_ns > absolute_unix_ns)
+        observed_latency_ns = (uint64_t)(current_unix_ns - absolute_unix_ns);
+    }
+  }
+  multicam_status_video(source, status_method, ntp_fresh, absolute_unix_ns,
+                        observed_latency_ns,
+                        frame_out->width, frame_out->height, source->pts_offset,
+                        status_now_ns);
+  if (ntp_fresh && absolute_unix_ns > 0) {
+    source->last_video_capture_time_ns = capture_display_time;
+    source->last_video_capture_mono_ns = status_now_ns;
+    if (source->last_audio_pts_mono_ns &&
+        status_now_ns >= source->last_audio_pts_mono_ns &&
+        status_now_ns - source->last_audio_pts_mono_ns <= 500000000ULL) {
+      int64_t audio_offset_ns;
+      if (receiver_audio_pts_anchor_offset_ns(
+              capture_display_time, status_now_ns, source->last_audio_pts_ns,
+              source->last_audio_pts_mono_ns, &audio_offset_ns)) {
+        bool first_audio_anchor = !source->audio_pts_offset_valid;
+        source->audio_pts_offset_ns = first_audio_anchor
+            ? audio_offset_ns
+            : receiver_smooth_audio_pts_offset_ns(
+                  source->audio_pts_offset_ns, audio_offset_ns);
+        source->audio_pts_offset_valid = true;
+        source->audio_waiting_for_anchor_since_ns = 0;
+        if (first_audio_anchor) {
+          double relative_offset_ms =
+              ((double)source->audio_pts_offset_ns -
+               (double)source->pts_offset) / 1000000.0;
+          receiver_log(LOG_INFO, source,
+                       "Audio PTS epoch anchored to video capture clock (relative correction: %.3f ms)",
+                       relative_offset_ms);
+        }
+      }
+    }
+    if (!source->smoothed_input_latency_ns) {
+      source->smoothed_input_latency_ns = observed_latency_ns;
+    } else if (observed_latency_ns >= source->smoothed_input_latency_ns) {
+      source->smoothed_input_latency_ns +=
+          (observed_latency_ns - source->smoothed_input_latency_ns) / 8;
+    } else {
+      source->smoothed_input_latency_ns -=
+          (source->smoothed_input_latency_ns - observed_latency_ns) / 8;
+    }
+    multicam_status_set_sync_latency(source,
+                                     source->smoothed_input_latency_ns);
+  }
+
+  /* The shared delay state changes at a bounded rate. This avoids timestamp
+   * jumps when a peer stops sending frames and returns after a low-bitrate or
+   * LLB interval. OBS buffers future frames by timestamp and syncs audio to
+   * the same source clock. */
+  double group_playout_speed = 1.0;
+  uint64_t group_playout_latency_ns =
+      multicam_status_group_playout_latency_ns(status_now_ns,
+                                                &group_playout_speed);
+  if (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP ||
+      source->sync_method == SYNC_METHOD_MOBLIN_TIMECODE) {
+    uint64_t applied_source_wait_ns =
+        group_playout_latency_ns > source->smoothed_input_latency_ns
+            ? group_playout_latency_ns - source->smoothed_input_latency_ns : 0;
+    multicam_status_set_playout_delay(source, applied_source_wait_ns);
+  } else {
+    multicam_status_set_playout_delay(source, 0);
+  }
+  source->audio_playout_speed = group_playout_speed;
+  obs_frame.timestamp = receiver_add_playout_latency_ns(
+      obs_frame.timestamp, group_playout_latency_ns);
 
   /* Push the frame to OBS */
   obs_source_output_video(source->context, &obs_frame);
+  receiver_diagnostics_video_sample(source, status_now_ns, frame_out->pts,
+                                    obs_frame.timestamp, ntp_fresh,
+                                    group_playout_latency_ns,
+                                    group_playout_speed);
+  source->last_video_output_mono_ns = os_gettime_ns();
+  source->video_output_cleared = false;
 
   /* Update the statistics */
   update_statistics(source);
@@ -605,28 +1061,25 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   return true;
 }
 
-/* Synchronised timestamp (PTS -> SystemTime) */
-int64_t get_sync_timestamp(sei_receiver_source_t *source, int64_t pts) {
+/* Synchronised timestamp (PTS nanoseconds -> OBS monotonic nanoseconds) */
+int64_t get_sync_timestamp(sei_receiver_source_t *source, int64_t pts_ns) {
   if (!source)
     return 0;
 
   int64_t current_time = os_gettime_ns();
 
-  /* PTS to ns: FFmpeg PTS is timebase-based; assume 90 kHz (SRT/MPEG-TS)
-   */
-  /* Take care if the PTS is already in ns (e.g. after AV_NOPTS_VALUE) */
-  /* callers normally pass an already-converted ns PTS */
+  /* All callers pass timestamps converted to nanoseconds. */
 
   if (!source->has_pts_offset) {
-    source->pts_offset = current_time - pts;
+    source->pts_offset = current_time - pts_ns;
     source->has_pts_offset = true;
 
     receiver_log(LOG_INFO, source,
                  "Initialized Sync Offset: PTS=%lld, Local=%lld, Offset=%lld",
-                 pts, current_time, source->pts_offset);
+                 pts_ns, current_time, source->pts_offset);
   }
 
-  return pts + source->pts_offset;
+  return pts_ns + source->pts_offset;
 }
 
 /* Compute the video presentation time */
@@ -637,25 +1090,40 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
   }
 
   /* With an NTP timestamp, and NTP sync enabled */
-  if (frame->has_ntp && source->ntp_enabled) {
+  if (frame->has_ntp && source->ntp_enabled &&
+      !ntp_client_needs_resync(
+          &source->ntp_client,
+          receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms))) {
     /* Nanoseconds for the NTP timestamp */
-    uint64_t ntp_ns =
-        ((uint64_t)frame->ntp_time.seconds * 1000000000ULL) +
-        (((uint64_t)frame->ntp_time.fraction * 1000000000ULL) >> 32);
-
-    /* NTP mode: absolute-time sync */
-    /* Relies on the NTP client's global offset, not first-frame alignment */
-    /* Offset = NTP_Server - Local_System */
-    /* Local_Render_Time = Frame_NTP - Offset */
-
-    int64_t ntp_offset = ntp_client_get_offset(&source->ntp_client);
-    int64_t display_time = (int64_t)ntp_ns - ntp_offset;
+    /* Convert the absolute NTP stamp into OBS's monotonic timestamp domain
+     * using the NTP client's current server-time/monotonic-time anchor. */
+    ntp_timestamp_t current_ntp;
+    int64_t frame_ntp_ns, current_ntp_ns;
+    if (frame->ntp_time.seconds < 3786825600U ||
+        !ntp_client_get_time(&source->ntp_client, &current_ntp) ||
+        !receiver_ntp_to_unix_ns(frame->ntp_time.seconds,
+                                 frame->ntp_time.fraction, &frame_ntp_ns) ||
+        !receiver_ntp_to_unix_ns(current_ntp.seconds, current_ntp.fraction,
+                                 &current_ntp_ns) ||
+        frame_ntp_ns - current_ntp_ns > 86400000000000LL ||
+        current_ntp_ns - frame_ntp_ns > 86400000000000LL) {
+      source->sync_method = SYNC_METHOD_PTS_FALLBACK;
+      return get_sync_timestamp(source, frame->pts);
+    }
+    int64_t display_time;
+    if (!receiver_ntp_to_monotonic_ns(
+            frame->ntp_time.seconds, frame->ntp_time.fraction,
+            current_ntp.seconds, current_ntp.fraction,
+            (int64_t)os_gettime_ns(), &display_time)) {
+      source->sync_method = SYNC_METHOD_PTS_FALLBACK;
+      return get_sync_timestamp(source, frame->pts);
+    }
 
     /* Log periodically only, to avoid flooding */
     if (source->sei_found_count % 300 == 0) {
       receiver_log(LOG_DEBUG, source,
-                   "Absolute Sync: NTP=%llu, Offset=%lld, Display=%lld", ntp_ns,
-                   ntp_offset, display_time);
+                   "Absolute Sync: NTP=%lld, LocalAnchor=%lld, Display=%lld",
+                   frame_ntp_ns, current_ntp_ns, display_time);
     }
 
     /* Update the shared PTS offset so audio follows the video's pacing */
@@ -668,11 +1136,25 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
     // if (source->sei_found_count % 1 == 0) // Always
     source->pts_offset = display_time - frame->pts;
     source->has_pts_offset = true;
+    source->absolute_sync_method = frame->timestamp_source;
+    if (source->absolute_sync_method != SYNC_METHOD_MOBLIN_TIMECODE)
+      source->absolute_sync_method = SYNC_METHOD_SEI_STAMPER_NTP;
+    source->sync_method = source->absolute_sync_method;
 
     return display_time;
   }
 
-  /* No NTP, or disabled: fall back to plain PTS sync */
+  bool ntp_fresh = source->ntp_enabled &&
+      !ntp_client_needs_resync(&source->ntp_client,
+          receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
+  if (receiver_keep_absolute_sync(
+          source->absolute_sync_method != SYNC_METHOD_UNKNOWN,
+          source->ntp_enabled, ntp_fresh) && source->has_pts_offset) {
+    source->sync_method = source->absolute_sync_method;
+    return get_sync_timestamp(source, frame->pts);
+  }
+  source->sync_method = SYNC_METHOD_PTS_FALLBACK;
+  source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
   return get_sync_timestamp(source, frame->pts);
 }
 
@@ -683,33 +1165,156 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
 
   AVCodecContext *ctx = (AVCodecContext *)source->audio_codec_context;
   int ret = avcodec_send_packet(ctx, packet);
-  if (ret < 0) {
+  /* FFmpeg's send/receive API is a strict pair: EAGAIN means decoded output
+   * must be drained before this same input packet can be retried. Treating it
+   * as a fatal error silently discarded audio exactly when the decoder was
+   * back-pressured after a transport hiccup. */
+  bool packet_pending = ret == AVERROR(EAGAIN);
+  if (ret < 0 && !packet_pending) {
     receiver_log(LOG_ERROR, source, "Error sending audio packet: %d", ret);
+    record_audio_decode_error(source);
     return false;
   }
 
   AVFrame *frame = av_frame_alloc();
   if (!frame)
+  {
+    record_audio_decode_error(source);
     return false;
+  }
 
   bool success = true;
-  while (ret >= 0) {
+  while (true) {
     ret = avcodec_receive_frame(ctx, frame);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+    if (ret == AVERROR(EAGAIN)) {
+      if (!packet_pending)
+        break;
+      ret = avcodec_send_packet(ctx, packet);
+      if (ret >= 0) {
+        packet_pending = false;
+        continue;
+      }
+      receiver_log(LOG_ERROR, source,
+                   "Error retrying audio packet after draining decoder: %d", ret);
+      record_audio_decode_error(source);
+      success = false;
       break;
-    } else if (ret < 0) {
+    }
+    if (ret == AVERROR_EOF)
+      break;
+    if (ret < 0) {
       receiver_log(LOG_ERROR, source, "Error receiving audio frame: %d", ret);
+      record_audio_decode_error(source);
       success = false;
       break;
     }
 
+    source->audio_decode_error_streak = 0;
     struct obs_source_audio audio = {0};
     int channels = frame->ch_layout.nb_channels;
-    for (int i = 0; i < MAX_AUDIO_CHANNELS && i < channels; i++) {
-      audio.data[i] = frame->data[i];
+    if (channels <= 0 || channels > MAX_AUDIO_CHANNELS || frame->sample_rate <= 0) {
+      receiver_log(LOG_WARNING, source, "Unsupported decoded audio layout/rate");
+      av_frame_unref(frame);
+      continue;
     }
 
-    audio.frames = frame->nb_samples;
+    uint64_t audio_now_ns = os_gettime_ns();
+    double group_playout_speed = 1.0;
+    uint64_t group_playout_latency_ns =
+        multicam_status_group_playout_latency_ns(audio_now_ns,
+                                                  &group_playout_speed);
+    source->audio_playout_speed = group_playout_speed;
+
+    /* The decoder can return packed or planar samples in multiple formats.
+     * Always convert into the declared OBS format (float planar) so the data
+     * layout and sample type agree with audio.format. */
+    SwrContext *resampler = (SwrContext *)source->audio_resampler;
+    if (resampler &&
+        (source->audio_resampler_sample_fmt != frame->format ||
+         source->audio_resampler_sample_rate != frame->sample_rate ||
+         av_channel_layout_compare(&source->audio_resampler_layout,
+                                   &frame->ch_layout) != 0)) {
+      swr_free(&resampler);
+      source->audio_resampler = NULL;
+      av_channel_layout_uninit(&source->audio_resampler_layout);
+      resampler = NULL;
+    }
+    if (!resampler) {
+      AVChannelLayout output_layout = frame->ch_layout;
+      ret = swr_alloc_set_opts2(&resampler, &output_layout, AV_SAMPLE_FMT_FLTP,
+                                frame->sample_rate, &frame->ch_layout,
+                                (enum AVSampleFormat)frame->format,
+                                frame->sample_rate, 0, NULL);
+      if (ret >= 0)
+        ret = swr_init(resampler);
+      if (ret < 0) {
+        receiver_log(LOG_ERROR, source, "Failed to initialize audio conversion: %d", ret);
+        record_audio_decode_error(source);
+        swr_free(&resampler);
+        source->audio_resampler = NULL;
+        success = false;
+        av_frame_unref(frame);
+        break;
+      }
+      source->audio_resampler = resampler;
+      source->audio_resampler_sample_fmt = frame->format;
+      source->audio_resampler_sample_rate = frame->sample_rate;
+      ret = av_channel_layout_copy(&source->audio_resampler_layout,
+                                   &frame->ch_layout);
+      if (ret < 0) {
+        swr_free(&resampler);
+        source->audio_resampler = NULL;
+        success = false;
+        av_frame_unref(frame);
+        break;
+      }
+    }
+
+    int requested_output_samples = receiver_sync_output_samples(
+        frame->nb_samples, group_playout_speed,
+        &source->audio_speed_fractional_carry);
+    ret = swr_set_compensation(resampler,
+                               requested_output_samples - frame->nb_samples,
+                               frame->nb_samples);
+    if (ret < 0) {
+      receiver_log(LOG_WARNING, source,
+                   "Could not apply bounded audio speed correction: %d", ret);
+      source->audio_speed_fractional_carry = 0.0;
+      swr_set_compensation(resampler, 0, frame->nb_samples);
+    }
+
+    /* Leave headroom for the full 15% slow-down plus SWR's small delay. */
+    int max_converted_samples =
+        frame->nb_samples + frame->nb_samples / 5 + 32;
+    uint8_t **converted = NULL;
+    int converted_line_size = 0;
+    ret = av_samples_alloc_array_and_samples(&converted, &converted_line_size,
+                                              channels, max_converted_samples,
+                                              AV_SAMPLE_FMT_FLTP, 0);
+    if (ret < 0) {
+      receiver_log(LOG_ERROR, source, "Failed to allocate converted audio: %d", ret);
+      record_audio_decode_error(source);
+      success = false;
+      av_frame_unref(frame);
+      break;
+    }
+    int converted_samples = swr_convert(resampler, converted,
+                                         max_converted_samples,
+                                         (const uint8_t **)frame->extended_data,
+                                         frame->nb_samples);
+    if (converted_samples < 0) {
+      receiver_log(LOG_ERROR, source, "Audio sample conversion failed: %d", converted_samples);
+      record_audio_decode_error(source);
+      av_freep(&converted[0]);
+      av_freep(&converted);
+      success = false;
+      av_frame_unref(frame);
+      break;
+    }
+
+    for (int i = 0; i < channels; i++)
+      audio.data[i] = converted[i];
+    audio.frames = (uint32_t)converted_samples;
 
     if (channels == 1)
       audio.speakers = SPEAKERS_MONO;
@@ -723,32 +1328,108 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       audio.speakers = SPEAKERS_UNKNOWN;
 
     audio.format = source->audio_format;
-    audio.samples_per_sec = source->audio_sample_rate;
+    audio.samples_per_sec = (uint32_t)frame->sample_rate;
 
     /* Timestamp sync */
     /* Get the audio PTS (timebase-based) */
-    int64_t pts = frame->pts;
+    int64_t pts = frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE)
+      pts = frame->pts;
+    if (pts == AV_NOPTS_VALUE)
+      pts = packet->pts;
     int64_t pts_ns = 0;
 
     if (pts != AV_NOPTS_VALUE) {
-      AVRational tb = ctx->time_base;
-      /* If the timebase is 0, try 1/sample_rate */
-      if (tb.num == 0 || tb.den == 0) {
-        tb.num = 1;
-        tb.den = ctx->sample_rate;
-      }
-      pts_ns = av_rescale_q(pts, tb, (AVRational){1, 1000000000});
+      AVFormatContext *format_ctx = (AVFormatContext *)source->format_context;
+      AVRational tb = format_ctx->streams[source->audio_stream_index]->time_base;
+      if (tb.num <= 0 || tb.den <= 0)
+        tb = (AVRational){1, frame->sample_rate};
+      pts_ns = receiver_pts_to_ns(pts, tb.num, tb.den);
     } else {
-      /* With no PTS, derive it from the current offset */
-      pts_ns = (int64_t)audio.timestamp - source->pts_offset;
-      if (!source->has_pts_offset)
-        pts_ns = 0;
+      /* Keep un-timestamped audio on the established local clock. */
+      pts_ns = source->has_pts_offset ? (int64_t)os_gettime_ns() - source->pts_offset :
+                                      (int64_t)os_gettime_ns();
+    }
+
+    if (pts != AV_NOPTS_VALUE) {
+      if (source->last_audio_pts_mono_ns &&
+          receiver_pts_has_backward_reset(source->last_audio_pts_ns, pts_ns,
+                                          PTS_BACKWARD_RESET_NS)) {
+        receiver_log(LOG_WARNING, source,
+                     "Audio PTS moved backwards; recalibrating audio clock to video");
+        source->audio_pts_resets++;
+        receiver_diagnostics_event(source, audio_now_ns, "audio_pts_reset",
+                                   source->last_audio_pts_ns, pts_ns);
+        source->audio_pts_offset_valid = false;
+        source->audio_output_clock.initialized = false;
+        source->audio_speed_fractional_carry = 0.0;
+      }
+      source->last_audio_pts_ns = pts_ns;
+      source->last_audio_pts_mono_ns = audio_now_ns;
+    }
+
+    /* Avoid initializing OBS audio from the local clock before the first video
+     * NTP anchor arrives. Non-NTP streams fall back after a short startup wait. */
+    if (source->ntp_enabled && !source->audio_pts_offset_valid &&
+        source->sync_method == SYNC_METHOD_UNKNOWN) {
+      if (!source->audio_waiting_for_anchor_since_ns)
+        source->audio_waiting_for_anchor_since_ns = audio_now_ns;
+      if (audio_now_ns >= source->audio_waiting_for_anchor_since_ns &&
+          audio_now_ns - source->audio_waiting_for_anchor_since_ns < 500000000ULL) {
+        multicam_status_audio(source, audio_now_ns);
+        av_freep(&converted[0]);
+        av_freep(&converted);
+        av_frame_unref(frame);
+        continue;
+      }
     }
 
     /* Use the shared timestamp sync */
-    audio.timestamp = (uint64_t)get_sync_timestamp(source, pts_ns);
+    pthread_mutex_lock(&source->audio_settings_lock);
+    int64_t audio_offset_ns = source->audio_offset_ns;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+    int64_t capture_audio_time;
+    if (pts != AV_NOPTS_VALUE && source->audio_pts_offset_valid &&
+        !receiver_add_signed_ns(pts_ns, source->audio_pts_offset_ns,
+                                &capture_audio_time)) {
+      capture_audio_time = get_sync_timestamp(source, pts_ns);
+    } else if (pts != AV_NOPTS_VALUE && source->audio_pts_offset_valid) {
+      /* Independent audio PTS origin is mapped to the NTP video capture clock. */
+    } else {
+      capture_audio_time = get_sync_timestamp(source, pts_ns);
+    }
+    uint64_t scheduled_audio_time = receiver_audio_timestamp_with_offset(
+        capture_audio_time, 0);
+    scheduled_audio_time = receiver_add_playout_latency_ns(
+        scheduled_audio_time, group_playout_latency_ns);
+    if (!source->audio_output_clock.initialized ||
+        source->audio_output_clock.sample_rate != (uint32_t)frame->sample_rate) {
+      receiver_audio_output_clock_start(&source->audio_output_clock,
+                                        scheduled_audio_time,
+                                        (uint32_t)frame->sample_rate);
+      source->audio_speed_fractional_carry = 0.0;
+    }
+    uint64_t audio_clock_next =
+        receiver_audio_output_clock_next_ns(&source->audio_output_clock);
+    int64_t audio_clock_signed =
+        audio_clock_next > (uint64_t)INT64_MAX
+            ? INT64_MAX : (int64_t)audio_clock_next;
+    audio.timestamp = receiver_audio_timestamp_with_offset(
+        audio_clock_signed, audio_offset_ns);
 
-    obs_source_output_audio(source->context, &audio);
+    if (converted_samples > 0) {
+      receiver_audio_output_clock_advance(
+          &source->audio_output_clock, (uint32_t)converted_samples);
+      obs_source_output_audio(source->context, &audio);
+      receiver_diagnostics_audio_sample(
+          source, audio_now_ns, frame->format, audio.format, frame->nb_samples,
+          converted_samples, audio.timestamp, group_playout_latency_ns,
+          group_playout_speed);
+    }
+    multicam_status_audio(source, audio_now_ns);
+    av_freep(&converted[0]);
+    av_freep(&converted);
+    av_frame_unref(frame);
   }
 
   av_frame_free(&frame);
@@ -779,12 +1460,25 @@ static void *receiver_source_create(obs_data_t *settings,
                                     obs_source_t *source) {
   sei_receiver_source_t *ctx = bzalloc(sizeof(sei_receiver_source_t));
   ctx->context = source;
+  ctx->diagnostic_source_id = receiver_diagnostics_assign_source_id();
+  ctx->reset_sync_requested = false;
+  ctx->reset_picture_requested = false;
+  ctx->last_video_pts_ns = AV_NOPTS_VALUE;
+  ctx->video_output_cleared = true;
+  ctx->audio_playout_speed = 1.0;
 
   /* Initialise the frame buffer */
   if (!frame_buffer_init(&ctx->frame_buffer)) {
     bfree(ctx);
     return NULL;
   }
+  if (pthread_mutex_init(&ctx->audio_settings_lock, NULL) != 0) {
+    frame_buffer_destroy(&ctx->frame_buffer);
+    bfree(ctx);
+    return NULL;
+  }
+  ctx->audio_settings_lock_initialized = true;
+  multicam_status_register(ctx, obs_source_get_name(source));
 
   /* Initialise the sync state */
   ctx->sync_state = SYNC_STATE_WAITING;
@@ -839,6 +1533,10 @@ static void *receiver_source_create(obs_data_t *settings,
   if (ctx->ntp_sync_interval_ms == 0) {
     ctx->ntp_sync_interval_ms = 10000; // default 10 s, to be safe
   }
+  ctx->audio_offset_ns =
+      (int64_t)obs_data_get_int(settings, "audio_offset_ms") * 1000000LL;
+  multicam_status_set_audio_offset(
+      ctx, (int32_t)(ctx->audio_offset_ns / 1000000LL));
 
   /* Initialise statistics and error recovery */
   ctx->last_stats_update_time = 0;
@@ -852,18 +1550,16 @@ static void *receiver_source_create(obs_data_t *settings,
   if (ctx->ntp_enabled) {
     if (ntp_client_init(&ctx->ntp_client, ctx->ntp_server, ctx->ntp_port)) {
       receiver_log(LOG_INFO, ctx, "NTP client initialized");
-
-      /* Do the initial sync */
-      if (ntp_client_sync(&ctx->ntp_client)) {
-        ctx->last_ntp_sync_time = os_gettime_ns();
-        receiver_log(LOG_INFO, ctx, "Initial NTP sync successful");
-      }
+      /* Resolve DNS and sync only on the NTP worker, never in OBS or decode. */
+      ntp_client_start_background_sync(&ctx->ntp_client,
+                                       ctx->ntp_sync_interval_ms);
     }
   }
 
   receiver_log(LOG_INFO, ctx, "SEI Receiver source created");
 
   /* Start immediately in the background */
+  register_receiver_context(ctx);
   start_receiver(ctx);
 
   return ctx;
@@ -874,8 +1570,9 @@ static void receiver_source_destroy(void *data) {
   sei_receiver_source_t *ctx = (sei_receiver_source_t *)data;
 
   /* Stop the receiver */
+  unregister_receiver_context(ctx);
   stop_receiver(ctx);
-
+  multicam_status_unregister(ctx);
   /* avformat owns the SRT connection; no manual socket close */
 
   /* Destroy the decoder */
@@ -896,6 +1593,10 @@ static void receiver_source_destroy(void *data) {
 
   /* Destroy the frame buffer */
   frame_buffer_destroy(&ctx->frame_buffer);
+  if (ctx->audio_settings_lock_initialized) {
+    pthread_mutex_destroy(&ctx->audio_settings_lock);
+    ctx->audio_settings_lock_initialized = false;
+  }
 
   /* Free the SwsContext */
   if (ctx->sws_ctx) {
@@ -923,12 +1624,16 @@ static void receiver_source_defaults(obs_data_t *settings) {
   obs_data_set_default_int(settings, "ntp_drift_threshold", 50); // 50 ms
   obs_data_set_default_int(settings, "ntp_sync_interval",
                            10000); // default 10000 ms (10 s)
+  obs_data_set_default_int(settings, "audio_offset_ms", 0);
 }
+
+static bool reset_sync_button(obs_properties_t *props, obs_property_t *property,
+                              void *data);
+static bool reset_picture_button(obs_properties_t *props,
+                                 obs_property_t *property, void *data);
 
 /* Properties */
 static obs_properties_t *receiver_source_properties(void *data) {
-  UNUSED_PARAMETER(data);
-
   obs_properties_t *props = obs_properties_create();
 
   /* SRT URL */
@@ -976,12 +1681,19 @@ static obs_properties_t *receiver_source_properties(void *data) {
                          10); // 10 ms to 1000 ms
 
   obs_properties_add_int(props, "ntp_sync_interval", "NTP Sync Interval (ms)",
-                         100, 3600000, 100); // 100 ms to 1 hour
+                         1000, 3600000, 1000); // 1 s to 1 hour
+
+  obs_properties_add_int(props, "audio_offset_ms",
+                         "Audio offset relative to video (ms)", -500, 500, 1);
+  obs_properties_add_button2(props, "reset_sync", "Reset synchronization",
+                             reset_sync_button, data);
+  obs_properties_add_button2(props, "reset_picture", "Reset picture / reconnect",
+                             reset_picture_button, data);
 
   /* Warning text */
   obs_properties_add_text(props, "ntp_interval_warning",
-                          "⚠️ Warning: Setting interval < 1000ms may cause "
-                          "stuttering on slow networks.",
+                          "NTP networking runs on a worker; failed requests "
+                          "use retry backoff.",
                           OBS_TEXT_INFO);
 
   /* Status info (read-only) */
@@ -995,9 +1707,47 @@ static obs_properties_t *receiver_source_properties(void *data) {
   return props;
 }
 
+static bool reset_sync_button(obs_properties_t *props, obs_property_t *property,
+                              void *data)
+{
+  UNUSED_PARAMETER(props);
+  UNUSED_PARAMETER(property);
+  sei_receiver_source_t *source = (sei_receiver_source_t *)data;
+  if (source) {
+    pthread_mutex_lock(&source->audio_settings_lock);
+    source->reset_sync_requested = true;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+  }
+  return true;
+}
+
+static bool reset_picture_button(obs_properties_t *props,
+                                 obs_property_t *property, void *data)
+{
+  UNUSED_PARAMETER(props);
+  UNUSED_PARAMETER(property);
+  sei_receiver_source_t *source = (sei_receiver_source_t *)data;
+  if (source) {
+    pthread_mutex_lock(&source->audio_settings_lock);
+    source->reset_picture_requested = true;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+  }
+  return true;
+}
+
 /* Update settings */
 static void receiver_source_update(void *data, obs_data_t *settings) {
   sei_receiver_source_t *ctx = (sei_receiver_source_t *)data;
+
+  int64_t audio_offset_ns =
+      (int64_t)obs_data_get_int(settings, "audio_offset_ms") * 1000000LL;
+  pthread_mutex_lock(&ctx->audio_settings_lock);
+  bool audio_offset_changed = ctx->audio_offset_ns != audio_offset_ns;
+  ctx->audio_offset_ns = audio_offset_ns;
+  pthread_mutex_unlock(&ctx->audio_settings_lock);
+  if (audio_offset_changed) {
+    multicam_status_set_audio_offset(ctx, (int32_t)(audio_offset_ns / 1000000LL));
+  }
 
   bool settings_changed = false;
 
@@ -1011,25 +1761,40 @@ static void receiver_source_update(void *data, obs_data_t *settings) {
     settings_changed = true;
   }
 
-  /* Update the NTP settings */
+  /* NTP settings may change while the receiver thread reads the clock. Stop
+   * that reader before changing its snapshot. Updating the worker is local and
+   * never joins it or performs DNS/socket I/O on OBS's UI thread. */
   bool ntp_enabled = obs_data_get_bool(settings, "ntp_enabled");
-  if (ntp_enabled != ctx->ntp_enabled) {
+  const char *configured_ntp_server = obs_data_get_string(settings, "ntp_server");
+  const char *ntp_server = configured_ntp_server && configured_ntp_server[0]
+                               ? configured_ntp_server : "time.windows.com";
+  uint16_t ntp_port = (uint16_t)obs_data_get_int(settings, "ntp_port");
+  if (!ntp_port) ntp_port = 123;
+  uint32_t ntp_interval = (uint32_t)obs_data_get_int(settings, "ntp_sync_interval");
+  if (!ntp_interval) ntp_interval = 10000;
+  if (ntp_enabled != ctx->ntp_enabled || strcmp(ntp_server, ctx->ntp_server) != 0 ||
+      ntp_port != ctx->ntp_port || ntp_interval != ctx->ntp_sync_interval_ms) {
+    stop_receiver(ctx);
     ctx->ntp_enabled = ntp_enabled;
-
-    if (ntp_enabled) {
-      const char *ntp_server = obs_data_get_string(settings, "ntp_server");
-      uint16_t ntp_port = (uint16_t)obs_data_get_int(settings, "ntp_port");
-
-      if (ntp_client_init(&ctx->ntp_client, ntp_server, ntp_port)) {
-        if (ntp_client_sync(&ctx->ntp_client)) {
-          ctx->last_ntp_sync_time = os_gettime_ns();
-          receiver_log(LOG_INFO, ctx, "NTP enabled and synchronized");
-        }
-      }
-    } else {
-      ntp_client_destroy(&ctx->ntp_client);
-      receiver_log(LOG_INFO, ctx, "NTP disabled");
+    strncpy(ctx->ntp_server, ntp_server, sizeof(ctx->ntp_server) - 1);
+    ctx->ntp_port = ntp_port;
+    ctx->ntp_sync_interval_ms = ntp_interval;
+    ctx->has_pts_offset = false;
+    ctx->sync_method = SYNC_METHOD_UNKNOWN;
+    ctx->absolute_sync_method = SYNC_METHOD_UNKNOWN;
+    if (ctx->ntp_client.is_initialized) {
+      ntp_client_update_settings(&ctx->ntp_client, ctx->ntp_server,
+                                 ctx->ntp_port, ntp_interval, ntp_enabled);
+      if (ntp_enabled && !ctx->ntp_client.sync_thread_active)
+        ntp_client_start_background_sync(&ctx->ntp_client, ntp_interval);
+    } else if (ntp_enabled &&
+               ntp_client_init(&ctx->ntp_client, ctx->ntp_server,
+                               ctx->ntp_port)) {
+      ntp_client_start_background_sync(&ctx->ntp_client, ntp_interval);
     }
+    receiver_log(LOG_INFO, ctx, "NTP worker settings updated (enabled: %s)",
+                 ntp_enabled ? "yes" : "no");
+    settings_changed = true;
   }
 
   /* Update the hardware decoder settings */
@@ -1083,6 +1848,8 @@ static void receiver_source_update(void *data, obs_data_t *settings) {
 }
 /* Helper: tear down the connection's resources */
 static void cleanup_connection(sei_receiver_source_t *source) {
+  if (source->last_video_output_mono_ns)
+    clear_output_video(source);
   if (source->format_context) {
     avformat_close_input((AVFormatContext **)&source->format_context);
     source->format_context = NULL;
@@ -1099,7 +1866,38 @@ static void cleanup_connection(sei_receiver_source_t *source) {
     avcodec_free_context((AVCodecContext **)&source->audio_codec_context);
     source->audio_codec_context = NULL;
   }
+  if (source->audio_resampler) {
+    SwrContext *resampler = (SwrContext *)source->audio_resampler;
+    swr_free(&resampler);
+    source->audio_resampler = NULL;
+  }
+  av_channel_layout_uninit(&source->audio_resampler_layout);
+  source->audio_decode_error_streak = 0;
+  source->audio_decoder_last_flush_ns = 0;
   source->is_connected = false;
+  source->has_pts_offset = false;
+  source->pts_offset = 0;
+  source->sync_method = SYNC_METHOD_UNKNOWN;
+  source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
+  source->first_ntp_time = 0;
+  source->first_local_time = 0;
+  source->last_video_pts_ns = AV_NOPTS_VALUE;
+  source->last_video_output_mono_ns = 0;
+  source->video_output_cleared = true;
+  source->smoothed_input_latency_ns = 0;
+  source->audio_pts_offset_ns = 0;
+  source->audio_pts_offset_valid = false;
+  source->audio_output_clock.initialized = false;
+  source->audio_playout_speed = 1.0;
+  source->audio_speed_fractional_carry = 0.0;
+  source->last_audio_pts_ns = 0;
+  source->last_audio_pts_mono_ns = 0;
+  source->last_video_capture_time_ns = 0;
+  source->last_video_capture_mono_ns = 0;
+  source->audio_waiting_for_anchor_since_ns = 0;
+  multicam_status_set_sync_latency(source, 0);
+  multicam_status_set_playout_delay(source, 0);
+  multicam_status_set_connection(source, false, NULL, false, 0, 0);
   receiver_log(LOG_INFO, source, "Connection closed and resources freed");
 }
 
@@ -1111,6 +1909,8 @@ static bool try_connect(sei_receiver_source_t *source) {
   AVFormatContext *fmt_ctx = avformat_alloc_context();
   if (!fmt_ctx)
     return false;
+  fmt_ctx->interrupt_callback.callback = interrupt_if_video_stale;
+  fmt_ctx->interrupt_callback.opaque = source;
 
   /* Set a timeout so it cannot block for long */
   AVDictionary *options = NULL;
@@ -1213,6 +2013,9 @@ static bool try_connect(sei_receiver_source_t *source) {
                  "Applied stream parameters with manual codec override");
   }
 
+  /* Make decoder PTS and best-effort timestamps use the stream's time base. */
+  cctx->pkt_timebase = vstream->time_base;
+
   /* Configure hardware decode */
   if (source->hw_decode_enabled && source->hw_device_ctx) {
     cctx->hw_device_ctx = av_buffer_ref((AVBufferRef *)source->hw_device_ctx);
@@ -1257,27 +2060,14 @@ static bool try_connect(sei_receiver_source_t *source) {
     if (acodec) {
       AVCodecContext *actx = avcodec_alloc_context3(acodec);
       avcodec_parameters_to_context(actx, astream->codecpar);
+      actx->pkt_timebase = astream->time_base;
       if (avcodec_open2(actx, acodec, NULL) >= 0) {
         source->audio_codec_context = actx;
         source->audio_stream_index = audio_idx;
-        /* Audio format mapping simplified for brevity, assume valid */
         source->audio_channels = actx->ch_layout.nb_channels;
         source->audio_sample_rate = actx->sample_rate;
-        source->audio_format = AUDIO_FORMAT_FLOAT_PLANAR; /* Default safe */
-
-        switch (actx->sample_fmt) {
-        case AV_SAMPLE_FMT_S16:
-          source->audio_format = AUDIO_FORMAT_16BIT;
-          break;
-        case AV_SAMPLE_FMT_S16P:
-          source->audio_format = AUDIO_FORMAT_16BIT_PLANAR;
-          break;
-        case AV_SAMPLE_FMT_FLT:
-          source->audio_format = AUDIO_FORMAT_FLOAT;
-          break;
-        default:
-          break;
-        }
+        /* decode_audio always converts into this OBS sample layout. */
+        source->audio_format = AUDIO_FORMAT_FLOAT_PLANAR;
 
         receiver_log(LOG_INFO, source, "Audio stream opened (idx: %d)",
                      audio_idx);
@@ -1288,6 +2078,9 @@ static bool try_connect(sei_receiver_source_t *source) {
   }
 
   source->is_connected = true;
+  multicam_status_set_connection(source, true, codec_name,
+                                 source->audio_stream_index >= 0,
+                                 source->width, source->height);
   receiver_log(LOG_INFO, source, "Connected successfully!");
   return true;
 }
@@ -1304,6 +2097,40 @@ static void *srt_receive_thread(void *data) {
   AVPacket *packet = av_packet_alloc();
 
   while (source->thread_active) {
+    pthread_mutex_lock(&source->audio_settings_lock);
+    bool reset_picture = source->reset_picture_requested;
+    source->reset_picture_requested = false;
+    bool reset_sync = source->reset_sync_requested;
+    source->reset_sync_requested = false;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+
+    if (reset_picture) {
+      receiver_log(LOG_WARNING, source,
+                   "Picture reset requested; reconnecting decoder and input");
+      cleanup_connection(source);
+    }
+    if (reset_sync) {
+      source->has_pts_offset = false;
+      source->pts_offset = 0;
+      source->sync_method = SYNC_METHOD_UNKNOWN;
+      source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
+      source->last_video_pts_ns = AV_NOPTS_VALUE;
+      source->smoothed_input_latency_ns = 0;
+      source->audio_pts_offset_ns = 0;
+      source->audio_pts_offset_valid = false;
+      source->audio_output_clock.initialized = false;
+      source->audio_playout_speed = 1.0;
+      source->audio_speed_fractional_carry = 0.0;
+      source->last_audio_pts_ns = 0;
+      source->last_audio_pts_mono_ns = 0;
+      source->last_video_capture_time_ns = 0;
+      source->last_video_capture_mono_ns = 0;
+      source->audio_waiting_for_anchor_since_ns = 0;
+      multicam_status_set_sync_latency(source, 0);
+      multicam_status_set_playout_delay(source, 0);
+      receiver_log(LOG_INFO, source,
+                   "Synchronization reset requested; waiting for a fresh absolute timestamp");
+    }
 
     /* 1. Not connected: try to connect */
     if (!source->is_connected) {
@@ -1321,6 +2148,7 @@ static void *srt_receive_thread(void *data) {
     if (source->is_connected && source->format_context) {
       int ret =
           av_read_frame((AVFormatContext *)source->format_context, packet);
+      clear_if_video_stale(source);
 
       if (ret < 0) {
         /* Read error or EOF -> drop the connection and reconnect */
@@ -1332,6 +2160,9 @@ static void *srt_receive_thread(void *data) {
         cleanup_connection(source);
         continue; /* back to the top of the loop, triggering a reconnect */
       }
+
+      multicam_status_add_packet(source, (size_t)packet->size,
+                                 os_gettime_ns());
 
       /* 3. Handle the packet */
       static uint64_t video_packet_count = 0;
@@ -1433,3 +2264,4 @@ struct obs_source_info sei_receiver_source_info = {
     .get_width = receiver_source_get_width,
     .get_height = receiver_source_get_height,
 };
+

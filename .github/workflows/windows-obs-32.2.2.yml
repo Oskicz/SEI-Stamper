@@ -1,0 +1,100 @@
+name: Windows OBS 32.2.2 build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Checkout the matching OBS SDK
+        uses: actions/checkout@v4
+        with:
+          repository: obsproject/obs-studio
+          ref: 32.2.2
+          path: obs-studio
+          submodules: recursive
+
+      - name: Build OBS 32.2.2 SDK and runtime
+        shell: pwsh
+        env:
+          CI: "true"
+        run: ./obs-studio/.github/scripts/Build-Windows.ps1 -Target x64 -Configuration Release
+
+      - name: Configure plugin against OBS 32.2.2
+        shell: pwsh
+        run: |
+          $deps = Resolve-Path obs-studio/.deps/obs-deps-2026-07-15-x64 -ErrorAction Stop
+          $env:OBS_SOURCE_DIR = (Resolve-Path obs-studio).Path
+          $env:OBS_BUILD_DIR = (Resolve-Path obs-studio/build_x64).Path
+          $env:OBS_DEPS_DIR = $deps.Path
+          $majorHeader = Join-Path $env:OBS_DEPS_DIR 'include/libavcodec/version_major.h'
+          if (-not (Select-String -Path $majorHeader -Pattern '^#define LIBAVCODEC_VERSION_MAJOR\s+62$' -Quiet)) {
+            throw 'OBS 32.2.2 build dependencies must provide FFmpeg libavcodec 62.'
+          }
+          "OBS_SOURCE_DIR=$env:OBS_SOURCE_DIR" >> $env:GITHUB_ENV
+          "OBS_BUILD_DIR=$env:OBS_BUILD_DIR" >> $env:GITHUB_ENV
+          "OBS_DEPS_DIR=$env:OBS_DEPS_DIR" >> $env:GITHUB_ENV
+          cmake -S . -B build-plugin -G 'Visual Studio 18 2026' -A x64 `
+            -DOBS_SOURCE_DIR="$env:OBS_SOURCE_DIR" `
+            -DOBS_BUILD_DIR="$env:OBS_BUILD_DIR" `
+            -DOBS_DEPS_DIR="$env:OBS_DEPS_DIR" `
+            -DBUILD_TESTING=ON
+
+      - name: Build plugin and hardware-independent tests
+        shell: pwsh
+        run: cmake --build build-plugin --config Release --parallel
+
+      - name: Run timestamp and audio conversion tests
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:OBS_DEPS_DIR/bin;$env:OBS_BUILD_DIR/rundir/Release/bin/64bit;$env:PATH"
+          ctest --test-dir build-plugin -C Release --output-on-failure
+
+      - name: Verify DLL and package OBS files
+        shell: pwsh
+        run: |
+          $dll = Resolve-Path build-plugin/plugin/Release/sei-stamper.dll -ErrorAction Stop
+          if ((Get-Item $dll).Length -eq 0) { throw 'The plugin DLL is empty.' }
+          $dllBytes = [IO.File]::ReadAllBytes($dll)
+          $peOffset = [BitConverter]::ToInt32($dllBytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 6 -gt $dllBytes.Length -or [Text.Encoding]::ASCII.GetString($dllBytes, $peOffset, 4) -ne "PE`0`0") {
+            throw 'The plugin DLL has an invalid PE header.'
+          }
+          $machine = [BitConverter]::ToUInt16($dllBytes, $peOffset + 4)
+          if ($machine -ne 0x8664) { throw ('The plugin DLL is not x64 (machine 0x{0:X4}).' -f $machine) }
+          $stage = Join-Path $env:RUNNER_TEMP 'sei-stamper-package'
+          New-Item -ItemType Directory -Force "$stage/obs-plugins/64bit" | Out-Null
+          New-Item -ItemType Directory -Force "$stage/data/obs-plugins/sei-stamper" | Out-Null
+          Copy-Item $dll "$stage/obs-plugins/64bit/sei-stamper.dll"
+          Copy-Item data/locale "$stage/data/obs-plugins/sei-stamper/locale" -Recurse
+          $srt = Get-ChildItem $env:OBS_BUILD_DIR/rundir/Release -Filter srt.dll -Recurse | Select-Object -First 1
+          if ($srt) { Copy-Item $srt.FullName "$stage/obs-plugins/64bit/srt.dll" }
+          @'
+          Install into an existing 64-bit OBS Studio 32.2.x installation:
+          - Copy obs-plugins/64bit/sei-stamper.dll to <OBS>/obs-plugins/64bit/.
+          - Copy data/obs-plugins/sei-stamper/locale to <OBS>/data/obs-plugins/sei-stamper/.
+          - If present, copy srt.dll to <OBS>/obs-plugins/64bit/.
+          Close OBS before copying, then restart it.
+          '@ | Set-Content "$stage/INSTALL.txt"
+          Compress-Archive -Path "$stage/*" -DestinationPath "$env:RUNNER_TEMP/sei-stamper-windows-obs-32.2.2-x64.zip" -Force
+          "ZIP_PATH=$env:RUNNER_TEMP/sei-stamper-windows-obs-32.2.2-x64.zip" >> $env:GITHUB_ENV
+
+      - name: Publish ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sei-stamper-windows-obs-32.2.2-x64
+          path: ${{ runner.temp }}/sei-stamper-windows-obs-32.2.2-x64.zip
+          if-no-files-found: error
+          retention-days: 90
