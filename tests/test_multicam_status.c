@@ -43,6 +43,9 @@ int main(void)
    * applying one common output timeline to audio and video. */
   int fast_key, slow_key;
   const uint64_t group_now = 30000000000ULL;
+  double group_speed = 0.85;
+  if (multicam_status_group_playout_latency_ns(group_now, &group_speed) != 0 ||
+      group_speed != 1.0) return 19;
   multicam_status_register(&fast_key, "Fast");
   multicam_status_register(&slow_key, "Slow");
   multicam_status_set_connection(&fast_key, true, "hevc", true, 1920, 1080);
@@ -55,7 +58,6 @@ int main(void)
                         group_now);
   multicam_status_set_sync_latency(&fast_key, 2666210000ULL);
   multicam_status_set_sync_latency(&slow_key, 4218210000ULL);
-  double group_speed = 1.0;
   if (multicam_status_group_playout_latency_ns(group_now, &group_speed) !=
       4338210000ULL || group_speed != 1.0) return 18;
   multicam_status_unregister(&fast_key);

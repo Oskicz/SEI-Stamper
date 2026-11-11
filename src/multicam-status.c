@@ -337,8 +337,15 @@ uint64_t multicam_status_group_playout_latency_ns(uint64_t now_ns,
       maximum_ns = s->sync_latency_ns;
     any_audio = any_audio || s->has_audio;
   }
-  if (minimum_ns == UINT64_MAX)
-    minimum_ns = 0;
+  if (minimum_ns == UINT64_MAX) {
+    /* Audio can ask for the group clock before the first NTP video frame,
+     * or while every synchronized receiver is offline/stale. Do not let that
+     * empty interval seed a zero-delay clock that then takes seconds to fill. */
+    group_delay_control = (receiver_group_delay_control_t){0};
+    if (playout_speed) *playout_speed = 1.0;
+    pthread_mutex_unlock(&status_lock);
+    return 0;
+  }
   uint64_t target_ns = receiver_group_playout_target_ns(
       maximum_ns, minimum_ns, any_audio);
   uint64_t applied_ns = receiver_group_delay_step(
