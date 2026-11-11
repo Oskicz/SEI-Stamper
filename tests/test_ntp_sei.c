@@ -788,12 +788,12 @@ static void test_group_delay_speed_curve(void)
   double small = receiver_sync_speed_for_skew_ns(200000000LL);
   double large = receiver_sync_speed_for_skew_ns(1500000000LL);
   double negative = receiver_sync_speed_for_skew_ns(-1500000000LL);
-  ASSERT_TRUE(small > 1.0 && small <= 1.05,
-              "moderate skew stays at or below 5 percent speed-up");
-  ASSERT_TRUE(large <= 1.15 && large > 1.14,
-              "large skew reaches but does not exceed 15 percent speed-up");
-  ASSERT_TRUE(negative >= 0.85 && negative < 0.86,
-              "large opposite skew reaches but does not exceed 15 percent slow-down");
+  ASSERT_TRUE(small > 1.0 && small <= 1.04,
+              "moderate skew stays at or below 4 percent speed-up");
+  ASSERT_TRUE(large <= 1.12 && large > 1.11,
+              "large skew reaches but does not exceed 12 percent speed-up");
+  ASSERT_TRUE(negative >= 0.88 && negative < 0.89,
+              "large opposite skew reaches but does not exceed 12 percent slow-down");
 }
 
 static void test_group_delay_slews_without_jumps(void)
@@ -811,9 +811,9 @@ static void test_group_delay_slews_without_jumps(void)
     uint64_t previous = applied;
     applied = receiver_group_delay_step(&control, 0, now, &speed);
     uint64_t change = previous > applied ? previous - applied : applied - previous;
-    ASSERT_TRUE(change <= 15000001ULL,
-                "100 ms step never changes the group delay by more than 15 ms");
-    ASSERT_TRUE(speed >= 1.0 && speed <= 1.15,
+    ASSERT_TRUE(change <= 10720001ULL,
+                "100 ms step never changes the group delay by more than 10.72 ms");
+    ASSERT_TRUE(speed >= 1.0 && speed <= 1.12,
                 "catch-up speed remains inside the configured cap");
   }
   ASSERT_TRUE(applied < 1000000000ULL,
@@ -830,9 +830,9 @@ static void test_group_delay_slews_without_jumps(void)
     fill = receiver_group_delay_step(&fill_control, 1500000000ULL,
                                      fill_now, &fill_speed);
     uint64_t change = fill > previous ? fill - previous : previous - fill;
-    ASSERT_TRUE(change <= 17650001ULL,
-                "buffer growth follows the 15 percent slow-down without a jump");
-    ASSERT_TRUE(fill_speed >= 0.85 && fill_speed <= 1.0,
+    ASSERT_TRUE(change <= 13640001ULL,
+                "buffer growth follows the 12 percent slow-down without a jump");
+    ASSERT_TRUE(fill_speed >= 0.88 && fill_speed <= 1.0,
                 "buffer growth slows media within the configured cap");
   }
 }
@@ -848,9 +848,9 @@ static void test_audio_output_clock_and_slowdown_capacity(void)
   ASSERT_EQ(receiver_audio_output_clock_next_ns(&clock), 5021333333ULL,
             "sample count advances the audio timestamp continuously");
   double carry = 0.0;
-  int slowed_samples = receiver_sync_output_samples(1024, 0.85, &carry);
+  int slowed_samples = receiver_sync_output_samples(1024, 0.88, &carry);
   ASSERT_TRUE(slowed_samples <= 1024 + 1024 / 5 + 32,
-              "15 percent slowdown fits in the resampler output allocation");
+              "12 percent slowdown fits in the resampler output allocation");
   ASSERT_TRUE(slowed_samples > 1024,
               "slowdown adds interpolated samples instead of truncating audio");
 }

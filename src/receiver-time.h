@@ -46,8 +46,10 @@ static inline uint64_t receiver_group_playout_target_ns(
 #define RECEIVER_SYNC_SPEED_DEADBAND_NS 1000000ULL
 #define RECEIVER_SYNC_SPEED_SOFT_ERROR_NS 250000000ULL
 #define RECEIVER_SYNC_SPEED_MAX_ERROR_NS 1500000000ULL
-#define RECEIVER_SYNC_SPEED_MIN 0.85
-#define RECEIVER_SYNC_SPEED_MAX 1.15
+#define RECEIVER_SYNC_SPEED_SOFT_CORRECTION 0.04
+#define RECEIVER_SYNC_SPEED_MAX_CORRECTION 0.12
+#define RECEIVER_SYNC_SPEED_MIN (1.0 - RECEIVER_SYNC_SPEED_MAX_CORRECTION)
+#define RECEIVER_SYNC_SPEED_MAX (1.0 + RECEIVER_SYNC_SPEED_MAX_CORRECTION)
 
 typedef struct receiver_group_delay_control {
   bool initialized;
@@ -64,7 +66,7 @@ typedef struct receiver_audio_output_clock {
 } receiver_audio_output_clock_t;
 
 /* Positive skew speeds media up; negative skew slows it down. Map a small
- * residual to at most 5% correction and large errors to at most 15%. */
+ * residual to at most 4% correction and large errors to at most 12%. */
 static inline double receiver_sync_speed_for_skew_ns(int64_t skew_ns)
 {
   uint64_t magnitude = skew_ns < 0
@@ -73,7 +75,8 @@ static inline double receiver_sync_speed_for_skew_ns(int64_t skew_ns)
     return 1.0;
   double correction;
   if (magnitude <= RECEIVER_SYNC_SPEED_SOFT_ERROR_NS) {
-    correction = 0.05 * (double)(magnitude - RECEIVER_SYNC_SPEED_DEADBAND_NS) /
+    correction = RECEIVER_SYNC_SPEED_SOFT_CORRECTION *
+                 (double)(magnitude - RECEIVER_SYNC_SPEED_DEADBAND_NS) /
                  (double)(RECEIVER_SYNC_SPEED_SOFT_ERROR_NS -
                           RECEIVER_SYNC_SPEED_DEADBAND_NS);
   } else {
@@ -81,7 +84,10 @@ static inline double receiver_sync_speed_for_skew_ns(int64_t skew_ns)
     uint64_t range = RECEIVER_SYNC_SPEED_MAX_ERROR_NS -
                      RECEIVER_SYNC_SPEED_SOFT_ERROR_NS;
     if (extra > range) extra = range;
-    correction = 0.05 + 0.10 * (double)extra / (double)range;
+    correction = RECEIVER_SYNC_SPEED_SOFT_CORRECTION +
+                 (RECEIVER_SYNC_SPEED_MAX_CORRECTION -
+                  RECEIVER_SYNC_SPEED_SOFT_CORRECTION) *
+                     (double)extra / (double)range;
   }
   return skew_ns > 0 ? 1.0 + correction : 1.0 - correction;
 }
