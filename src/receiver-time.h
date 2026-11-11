@@ -37,8 +37,9 @@ static inline uint64_t receiver_group_playout_target_ns(
                            ? maximum_input_age_ns
                            : relative_max;
   if (any_audio)
-    target_ns = receiver_add_playout_latency_ns(
-        target_ns, RECEIVER_AUDIO_JITTER_CUSHION_NS);
+    target_ns = target_ns > UINT64_MAX - RECEIVER_AUDIO_JITTER_CUSHION_NS
+                    ? UINT64_MAX
+                    : target_ns + RECEIVER_AUDIO_JITTER_CUSHION_NS;
   return target_ns > RECEIVER_MAX_GROUP_PLAYOUT_DELAY_NS
              ? RECEIVER_MAX_GROUP_PLAYOUT_DELAY_NS : target_ns;
 }
