@@ -774,7 +774,7 @@ static void test_group_playout_target_covers_latency_and_bounds_wait(void)
   ASSERT_EQ(receiver_group_playout_target_ns(10000000000ULL, 0, true),
             5120000000ULL,
             "fastest stream receives at most five seconds extra wait");
-  ASSERT_EQ(receiver_group_playout_target_ns(25000000000ULL, 0, true),
+  ASSERT_EQ(receiver_group_playout_target_ns(25000000000ULL, 6000000000ULL, true),
             RECEIVER_MAX_GROUP_PLAYOUT_DELAY_NS,
             "absolute delay remains bounded");
   ASSERT_EQ(receiver_group_playout_target_ns(1000000000ULL, 0, false),
