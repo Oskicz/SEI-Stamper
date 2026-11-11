@@ -320,27 +320,27 @@ uint64_t multicam_status_group_max_latency_ns(uint64_t now_ns)
 uint64_t multicam_status_group_playout_latency_ns(uint64_t now_ns,
                                                    double *playout_speed)
 {
-  uint64_t target_ns = 0;
+  uint64_t minimum_ns = UINT64_MAX;
+  uint64_t maximum_ns = 0;
   bool any_audio = false;
   pthread_mutex_lock(&status_lock);
   for (size_t i = 0; i < MULTICAM_STATUS_MAX_SOURCES; ++i) {
     const multicam_source_status_t *s = &slots[i].value;
-    if (!slots[i].key || !s->connected)
+    if (!slots[i].key || !s->connected || !s->ntp_fresh ||
+        (s->sync_method != MULTICAM_SYNC_SEI_STAMPER_NTP &&
+         s->sync_method != MULTICAM_SYNC_MOBLIN_TIMECODE) ||
+        !is_recent(s->last_video_mono_ns, now_ns))
       continue;
-    if (s->has_audio)
-      any_audio = true;
-    if (s->ntp_fresh &&
-        (s->sync_method == MULTICAM_SYNC_SEI_STAMPER_NTP ||
-         s->sync_method == MULTICAM_SYNC_MOBLIN_TIMECODE) &&
-        is_recent(s->last_video_mono_ns, now_ns) &&
-        s->sync_latency_ns > target_ns)
-      target_ns = s->sync_latency_ns;
+    if (s->sync_latency_ns < minimum_ns)
+      minimum_ns = s->sync_latency_ns;
+    if (s->sync_latency_ns > maximum_ns)
+      maximum_ns = s->sync_latency_ns;
+    any_audio = any_audio || s->has_audio;
   }
-  if (any_audio)
-    target_ns = receiver_add_playout_latency_ns(
-        target_ns, RECEIVER_AUDIO_JITTER_CUSHION_NS);
-  if (target_ns > 2000000000ULL)
-    target_ns = 2000000000ULL;
+  if (minimum_ns == UINT64_MAX)
+    minimum_ns = 0;
+  uint64_t target_ns = receiver_group_playout_target_ns(
+      maximum_ns, minimum_ns, any_audio);
   uint64_t applied_ns = receiver_group_delay_step(
       &group_delay_control, target_ns, now_ns, playout_speed);
   pthread_mutex_unlock(&status_lock);

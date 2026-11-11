@@ -764,6 +764,24 @@ static void test_playout_delay_updates_are_stable(void) {
 }
 
 
+static void test_group_playout_target_covers_latency_and_bounds_wait(void)
+{
+  printf("  group playout target covers transport latency with bounded differential wait...\\n");
+  ASSERT_EQ(receiver_group_playout_target_ns(4218210000ULL, 2666210000ULL,
+                                             true),
+            4338210000ULL,
+            "slow stream latency plus shared audio cushion is retained");
+  ASSERT_EQ(receiver_group_playout_target_ns(10000000000ULL, 0, true),
+            5120000000ULL,
+            "fastest stream receives at most five seconds extra wait");
+  ASSERT_EQ(receiver_group_playout_target_ns(25000000000ULL, 0, true),
+            RECEIVER_MAX_GROUP_PLAYOUT_DELAY_NS,
+            "absolute delay remains bounded");
+  ASSERT_EQ(receiver_group_playout_target_ns(1000000000ULL, 0, false),
+            1000000000ULL,
+            "video-only groups do not add audio cushion");
+}
+
 static void test_group_delay_speed_curve(void)
 {
   printf("  adaptive group speed is bounded by skew...\n");
@@ -907,6 +925,7 @@ int main(void) {
   test_audio_decoder_recovery_threshold();
   test_playout_timestamps_use_common_latency();
   test_playout_delay_updates_are_stable();
+  test_group_playout_target_covers_latency_and_bounds_wait();
   test_group_delay_speed_curve();
   test_group_delay_slews_without_jumps();
   test_audio_output_clock_and_slowdown_capacity();

@@ -19,6 +19,29 @@ typedef struct receiver_playout_delay_control {
 
 
 #define RECEIVER_AUDIO_JITTER_CUSHION_NS 120000000ULL
+#define RECEIVER_MAX_GROUP_RELATIVE_WAIT_NS 5000000000ULL
+#define RECEIVER_MAX_GROUP_PLAYOUT_DELAY_NS 10000000000ULL
+
+/* Limit the extra wait imposed on the fastest camera while allowing the
+ * common output clock to cover real multi-second transport latency. */
+static inline uint64_t receiver_group_playout_target_ns(
+    uint64_t maximum_input_age_ns, uint64_t minimum_input_age_ns,
+    bool any_audio)
+{
+  uint64_t relative_max = minimum_input_age_ns >
+                                  UINT64_MAX - RECEIVER_MAX_GROUP_RELATIVE_WAIT_NS
+                              ? UINT64_MAX
+                              : minimum_input_age_ns +
+                                    RECEIVER_MAX_GROUP_RELATIVE_WAIT_NS;
+  uint64_t target_ns = maximum_input_age_ns < relative_max
+                           ? maximum_input_age_ns
+                           : relative_max;
+  if (any_audio)
+    target_ns = receiver_add_playout_latency_ns(
+        target_ns, RECEIVER_AUDIO_JITTER_CUSHION_NS);
+  return target_ns > RECEIVER_MAX_GROUP_PLAYOUT_DELAY_NS
+             ? RECEIVER_MAX_GROUP_PLAYOUT_DELAY_NS : target_ns;
+}
 #define RECEIVER_SYNC_SPEED_DEADBAND_NS 1000000ULL
 #define RECEIVER_SYNC_SPEED_SOFT_ERROR_NS 250000000ULL
 #define RECEIVER_SYNC_SPEED_MAX_ERROR_NS 1500000000ULL

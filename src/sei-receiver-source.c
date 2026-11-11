@@ -862,11 +862,6 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     }
     multicam_status_set_sync_latency(source,
                                      source->smoothed_input_latency_ns);
-    uint64_t group_max_latency =
-        multicam_status_group_max_latency_ns(status_now_ns);
-    multicam_status_set_playout_delay(
-        source, multicam_status_playout_delay(group_max_latency,
-                                              source->smoothed_input_latency_ns));
   }
 
   /* The shared delay state changes at a bounded rate. This avoids timestamp
@@ -877,6 +872,15 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   uint64_t group_playout_latency_ns =
       multicam_status_group_playout_latency_ns(status_now_ns,
                                                 &group_playout_speed);
+  if (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP ||
+      source->sync_method == SYNC_METHOD_MOBLIN_TIMECODE) {
+    uint64_t applied_source_wait_ns =
+        group_playout_latency_ns > source->smoothed_input_latency_ns
+            ? group_playout_latency_ns - source->smoothed_input_latency_ns : 0;
+    multicam_status_set_playout_delay(source, applied_source_wait_ns);
+  } else {
+    multicam_status_set_playout_delay(source, 0);
+  }
   source->audio_playout_speed = group_playout_speed;
   obs_frame.timestamp = receiver_add_playout_latency_ns(
       obs_frame.timestamp, group_playout_latency_ns);
