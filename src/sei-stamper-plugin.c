@@ -15,6 +15,7 @@
 
 #include <obs-module.h>
 #include <util/platform.h>
+#include "sei-receiver-source.h"
 #include "multicam-sync-dock.h"
 
 OBS_DECLARE_MODULE()
@@ -39,6 +40,7 @@ extern struct obs_source_info sei_receiver_source_info;
 
 // Module load
 bool obs_module_load(void) {
+  sei_receiver_diagnostics_init();
   blog(LOG_INFO, "SEI Stamper Plugin loaded");
 
   /* Register three independent SEI Stamper encoders, one per codec */
@@ -65,6 +67,7 @@ bool obs_module_load(void) {
 // Module unload
 void obs_module_unload(void) {
   multicam_sync_dock_unload();
+  sei_receiver_diagnostics_shutdown();
   blog(LOG_INFO, "[SEI Stamper] Plugin unloaded");
 }
 

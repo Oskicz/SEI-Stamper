@@ -98,6 +98,7 @@ set(PLUGIN_SOURCES
     src/nvenc-encoder.c
     src/amd-encoder.c
     src/sei-receiver-source.c
+    src/receiver-diagnostics.c
     src/multicam-status.c
     src/multicam-sync-dock.cpp
 )
@@ -159,6 +160,13 @@ target_link_libraries(sei-stamper
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(sei-diagnostics-tests
+        tests/test_diagnostics.c
+        src/receiver-diagnostics.c
+    )
+    target_include_directories(sei-diagnostics-tests PRIVATE \${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME sei-diagnostics-tests COMMAND sei-diagnostics-tests)
+
     add_executable(sei-core-tests tests/test_ntp_sei.c)
     target_include_directories(sei-core-tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME sei-core-tests COMMAND sei-core-tests)

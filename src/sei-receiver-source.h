@@ -72,6 +72,13 @@ typedef struct sei_receiver_source {
   bool reset_picture_requested;
   int64_t last_video_pts_ns;
   uint64_t last_video_output_mono_ns;
+  uint64_t last_video_diagnostics_mono_ns;
+  uint64_t last_audio_diagnostics_mono_ns;
+  uint64_t last_event_diagnostics_mono_ns;
+  uint64_t diagnostic_source_id;
+  uint64_t video_pts_resets;
+  uint64_t audio_pts_resets;
+  uint64_t audio_decoder_recoveries;
   bool video_output_cleared;
   uint64_t smoothed_input_latency_ns;
   receiver_audio_output_clock_t audio_output_clock;
@@ -171,6 +178,8 @@ typedef struct sei_receiver_source {
 /* Remove filters left by older plugin builds and recreate one managed filter
  * for each loaded receiver. Call on the OBS UI thread after collection load. */
 void sei_receiver_cleanup_playout_filters(void);
+void sei_receiver_diagnostics_init(void);
+void sei_receiver_diagnostics_shutdown(void);
 
 /* Source plugin info */
 extern struct obs_source_info sei_receiver_source_info;

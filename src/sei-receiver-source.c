@@ -9,10 +9,14 @@
 #include "receiver-time.h"
 #include "moblin-timecode.h"
 #include "multicam-status.h"
+#include "receiver-diagnostics.h"
 #include <media-io/video-io.h>
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/threading.h>
+
+#include <stdio.h>
+#include <string.h>
 
 /* FFmpeg Headers */
 #include <libavcodec/avcodec.h>
@@ -40,6 +44,158 @@
 #define VIDEO_STALE_TIMEOUT_NS 2000000000ULL
 #define PTS_BACKWARD_RESET_NS 500000000ULL
 #define MAX_SYNC_PLAYOUT_DELAY_NS 2000000000ULL
+#define RECEIVER_DIAGNOSTICS_INTERVAL_NS 10000000000ULL
+#define RECEIVER_DIAGNOSTICS_MAX_BYTES (1024U * 1024U)
+#define RECEIVER_DIAGNOSTICS_BACKUPS 2U
+
+static pthread_mutex_t receiver_diagnostics_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *receiver_diagnostics_path;
+static uint64_t receiver_diagnostics_next_source_id = 1;
+static bool receiver_diagnostics_warned;
+
+void sei_receiver_diagnostics_init(void)
+{
+  pthread_mutex_lock(&receiver_diagnostics_lock);
+  if (!receiver_diagnostics_path) {
+    char *path = obs_module_config_path("multicam-diagnostics.jsonl");
+    if (path) {
+      char *directory = bstrdup(path);
+      if (directory) {
+        char *slash = strrchr(directory, '/');
+        char *backslash = strrchr(directory, '\\');
+        if (!slash || (backslash && backslash > slash))
+          slash = backslash;
+        if (slash) {
+          *slash = '\0';
+          os_mkdirs(directory);
+        }
+        bfree(directory);
+      }
+      receiver_diagnostics_path = path;
+      blog(LOG_INFO, "[SEI Receiver] Bounded diagnostics: %s (1 MiB + 2 backups)", path);
+    } else {
+      blog(LOG_WARNING, "[SEI Receiver] Could not resolve diagnostics path");
+    }
+  }
+  pthread_mutex_unlock(&receiver_diagnostics_lock);
+}
+
+void sei_receiver_diagnostics_shutdown(void)
+{
+  pthread_mutex_lock(&receiver_diagnostics_lock);
+  bfree(receiver_diagnostics_path);
+  receiver_diagnostics_path = NULL;
+  pthread_mutex_unlock(&receiver_diagnostics_lock);
+}
+
+static uint64_t receiver_diagnostics_assign_source_id(void)
+{
+  pthread_mutex_lock(&receiver_diagnostics_lock);
+  uint64_t id = receiver_diagnostics_next_source_id++;
+  if (receiver_diagnostics_next_source_id == 0)
+    receiver_diagnostics_next_source_id = 1;
+  pthread_mutex_unlock(&receiver_diagnostics_lock);
+  return id;
+}
+
+static bool receiver_diagnostics_interval_due(uint64_t last_ns, uint64_t now_ns)
+{
+  return !last_ns || now_ns < last_ns ||
+         now_ns - last_ns >= RECEIVER_DIAGNOSTICS_INTERVAL_NS;
+}
+
+static void receiver_diagnostics_write(sei_receiver_source_t *source,
+                                      const char *json_line)
+{
+  if (!source || !json_line)
+    return;
+  pthread_mutex_lock(&receiver_diagnostics_lock);
+  bool written = receiver_diagnostics_path &&
+      receiver_diagnostics_append(receiver_diagnostics_path, json_line,
+                                  RECEIVER_DIAGNOSTICS_MAX_BYTES,
+                                  RECEIVER_DIAGNOSTICS_BACKUPS);
+  bool warn = !written && !receiver_diagnostics_warned;
+  if (warn)
+    receiver_diagnostics_warned = true;
+  pthread_mutex_unlock(&receiver_diagnostics_lock);
+  if (warn)
+    receiver_log(LOG_WARNING, source,
+                 "Could not append bounded receiver diagnostics; streaming continues");
+}
+
+static void receiver_diagnostics_video_sample(
+    sei_receiver_source_t *source, uint64_t now_ns, int64_t input_pts_ns,
+    uint64_t output_pts_ns, bool ntp_fresh, uint64_t group_delay_ns,
+    double speed)
+{
+  if (!source || !receiver_diagnostics_interval_due(
+                     source->last_video_diagnostics_mono_ns, now_ns))
+    return;
+  source->last_video_diagnostics_mono_ns = now_ns;
+  double output_lead_ms = ((double)output_pts_ns - (double)now_ns) / 1000000.0;
+  char line[512];
+  snprintf(line, sizeof(line),
+      "{\"kind\":\"video\",\"source_id\":%llu,\"mono_ns\":%llu,\"sync_method\":%d,\"ntp_fresh\":%s,\"input_pts_ns\":%lld,\"output_pts_ns\":%llu,\"output_lead_ms\":%.3f,\"input_latency_ms\":%.3f,\"source_wait_ms\":%.3f,\"group_delay_ms\":%.3f,\"speed\":%.5f,\"fps\":%.3f,\"decode_errors\":%llu,\"pts_resets\":%llu}\n",
+      (unsigned long long)source->diagnostic_source_id,
+      (unsigned long long)now_ns, (int)source->sync_method,
+      ntp_fresh ? "true" : "false", (long long)input_pts_ns,
+      (unsigned long long)output_pts_ns, output_lead_ms,
+      (double)source->smoothed_input_latency_ns / 1000000.0,
+      (double)((group_delay_ns > source->smoothed_input_latency_ns &&
+                (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP ||
+                 source->sync_method == SYNC_METHOD_MOBLIN_TIMECODE))
+                   ? group_delay_ns - source->smoothed_input_latency_ns : 0) /
+          1000000.0,
+      (double)group_delay_ns / 1000000.0, speed,
+      (double)source->current_fps,
+      (unsigned long long)source->decode_errors_total,
+      (unsigned long long)source->video_pts_resets);
+  receiver_diagnostics_write(source, line);
+}
+
+static void receiver_diagnostics_audio_sample(
+    sei_receiver_source_t *source, uint64_t now_ns, int input_format,
+    int output_format, int input_samples, int output_samples,
+    uint64_t output_pts_ns, uint64_t group_delay_ns, double speed)
+{
+  if (!source || !receiver_diagnostics_interval_due(
+                     source->last_audio_diagnostics_mono_ns, now_ns))
+    return;
+  source->last_audio_diagnostics_mono_ns = now_ns;
+  double output_lead_ms = ((double)output_pts_ns - (double)now_ns) / 1000000.0;
+  char line[512];
+  snprintf(line, sizeof(line),
+      "{\"kind\":\"audio\",\"source_id\":%llu,\"mono_ns\":%llu,\"input_sample_format\":%d,\"obs_sample_format\":%d,\"input_samples\":%d,\"output_samples\":%d,\"audio_timestamp_ns\":%llu,\"output_lead_ms\":%.3f,\"audio_anchor_offset_ms\":%.3f,\"group_delay_ms\":%.3f,\"speed\":%.5f,\"decode_errors\":%llu,\"pts_resets\":%llu,\"decoder_recoveries\":%llu}\n",
+      (unsigned long long)source->diagnostic_source_id,
+      (unsigned long long)now_ns, input_format, output_format,
+      input_samples, output_samples, (unsigned long long)output_pts_ns,
+      output_lead_ms, (double)source->audio_pts_offset_ns / 1000000.0,
+      (double)group_delay_ns / 1000000.0, speed,
+      (unsigned long long)source->audio_decode_errors_total,
+      (unsigned long long)source->audio_pts_resets,
+      (unsigned long long)source->audio_decoder_recoveries);
+  receiver_diagnostics_write(source, line);
+}
+
+static void receiver_diagnostics_event(sei_receiver_source_t *source,
+                                       uint64_t now_ns, const char *event,
+                                       int64_t previous_pts_ns,
+                                       int64_t current_pts_ns)
+{
+  if (!source || !event ||
+      (source->last_event_diagnostics_mono_ns &&
+       now_ns >= source->last_event_diagnostics_mono_ns &&
+       now_ns - source->last_event_diagnostics_mono_ns < 1000000000ULL))
+    return;
+  source->last_event_diagnostics_mono_ns = now_ns;
+  char line[384];
+  snprintf(line, sizeof(line),
+      "{\"kind\":\"event\",\"source_id\":%llu,\"mono_ns\":%llu,\"event\":\"%s\",\"previous_pts_ns\":%lld,\"current_pts_ns\":%lld}\n",
+      (unsigned long long)source->diagnostic_source_id,
+      (unsigned long long)now_ns, event,
+      (long long)previous_pts_ns, (long long)current_pts_ns);
+  receiver_diagnostics_write(source, line);
+}
 
 typedef struct receiver_context_node {
   sei_receiver_source_t *context;
@@ -371,6 +527,9 @@ static void record_audio_decode_error(sei_receiver_source_t *source)
   }
   av_channel_layout_uninit(&source->audio_resampler_layout);
   source->audio_decoder_last_flush_ns = now_ns;
+  source->audio_decoder_recoveries++;
+  receiver_diagnostics_event(source, now_ns, "audio_decoder_recovery",
+                             AV_NOPTS_VALUE, AV_NOPTS_VALUE);
   source->audio_decode_error_streak = 0;
   receiver_log(LOG_WARNING, source,
                "Audio decoder recovered after repeated decode errors");
@@ -497,19 +656,12 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   }
 
   /* Send the packet to the decoder */
-  static uint64_t send_count = 0;
-  send_count++;
-
   int ret = avcodec_send_packet(codec_ctx, packet);
   if (ret < 0) {
     receiver_log(LOG_ERROR, source, "Failed to send packet to decoder: %d (%s)",
                  ret, av_err2str(ret));
     record_decode_error(source);
     return false;
-  }
-
-  if (send_count % 30 == 1) {
-    receiver_log(LOG_INFO, source, "Packet sent to decoder: #%llu", send_count);
   }
 
   /* Receive the decoded frame */
@@ -555,14 +707,6 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
       reset_decoder(source);
     }
     return false;
-  }
-
-  static uint64_t video_frame_count = 0;
-  video_frame_count++;
-  if (video_frame_count % 30 == 1) {
-    receiver_log(
-        LOG_INFO, source, "Video frame decoded: #%llu, format=%d, size=%dx%d",
-        video_frame_count, av_frame->format, av_frame->width, av_frame->height);
   }
 
   /* Decode succeeded; reset the error count */
@@ -617,6 +761,9 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                                       PTS_BACKWARD_RESET_NS)) {
     receiver_log(LOG_WARNING, source,
                  "Video PTS moved backwards; resetting sync anchor");
+    source->video_pts_resets++;
+    receiver_diagnostics_event(source, os_gettime_ns(), "video_pts_reset",
+                               source->last_video_pts_ns, pts_ns);
     source->has_pts_offset = false;
     source->pts_offset = 0;
     source->audio_pts_offset_ns = 0;
@@ -885,16 +1032,12 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   obs_frame.timestamp = receiver_add_playout_latency_ns(
       obs_frame.timestamp, group_playout_latency_ns);
 
-  /* Debug log: confirm the timestamp */
-  receiver_log(
-      LOG_DEBUG, source,
-      "Video Decoded: %dx%d, PTS_IN=%lld, TS_OUT=%lld, group_delay=%llu ms, speed=%.3f",
-      obs_frame.width, obs_frame.height, packet->pts, obs_frame.timestamp,
-      (unsigned long long)(group_playout_latency_ns / 1000000ULL),
-      group_playout_speed);
-
   /* Push the frame to OBS */
   obs_source_output_video(source->context, &obs_frame);
+  receiver_diagnostics_video_sample(source, status_now_ns, frame_out->pts,
+                                    obs_frame.timestamp, ntp_fresh,
+                                    group_playout_latency_ns,
+                                    group_playout_speed);
   source->last_video_output_mono_ns = os_gettime_ns();
   source->video_output_cleared = false;
 
@@ -1212,6 +1355,9 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
                                           PTS_BACKWARD_RESET_NS)) {
         receiver_log(LOG_WARNING, source,
                      "Audio PTS moved backwards; recalibrating audio clock to video");
+        source->audio_pts_resets++;
+        receiver_diagnostics_event(source, audio_now_ns, "audio_pts_reset",
+                                   source->last_audio_pts_ns, pts_ns);
         source->audio_pts_offset_valid = false;
         source->audio_output_clock.initialized = false;
         source->audio_speed_fractional_carry = 0.0;
@@ -1273,6 +1419,10 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       receiver_audio_output_clock_advance(
           &source->audio_output_clock, (uint32_t)converted_samples);
       obs_source_output_audio(source->context, &audio);
+      receiver_diagnostics_audio_sample(
+          source, audio_now_ns, frame->format, audio.format, frame->nb_samples,
+          converted_samples, audio.timestamp, group_playout_latency_ns,
+          group_playout_speed);
     }
     multicam_status_audio(source, audio_now_ns);
     av_freep(&converted[0]);
@@ -1308,6 +1458,7 @@ static void *receiver_source_create(obs_data_t *settings,
                                     obs_source_t *source) {
   sei_receiver_source_t *ctx = bzalloc(sizeof(sei_receiver_source_t));
   ctx->context = source;
+  ctx->diagnostic_source_id = receiver_diagnostics_assign_source_id();
   ctx->reset_sync_requested = false;
   ctx->reset_picture_requested = false;
   ctx->last_video_pts_ns = AV_NOPTS_VALUE;

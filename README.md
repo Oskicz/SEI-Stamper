@@ -267,3 +267,8 @@ The entries below are retained historical release notes, not current compatibili
 **Current Version**: 1.3.0
 **Last Updated**: 2026-09-05
 
+
+
+## Receiver diagnostic log
+
+The receiver writes one compact JSONL sample per active source every 10 seconds and records timestamp resets and audio decoder recovery events. Samples include source-local IDs, NTP/sync mode, input/output timestamp relationship, group delay/speed, decoded audio sample format versus OBS output format, sample counts, and decode error totals. The log excludes source names, SRT URLs, stream IDs, hostnames, and credentials. It is written at the path printed once in the OBS log (normally under the OBS plugin configuration directory). Rotation keeps the active file plus two backups, each capped at 1 MiB (3 MiB maximum total). File writes occur only at the sampling interval or on a rate-limited event, never for every frame; an I/O failure emits a single OBS warning and does not stop streaming.
