@@ -82,8 +82,8 @@ int main(void)
   if (multicam_status_group_aligned(cameras, 2, now, 16666667ULL, &spread) ||
       spread != 1540000000ULL) return 3;
   if (multicam_status_group_aligned(cameras, 2, now, 10000000ULL, NULL)) return 4;
-  /* Newest decoded captures differ by the source waits; subtracting those
-   * waits estimates the same media time currently presented by OBS. */
+  /* The newest decoded captures lead the visible frame by each source's
+   * remaining wait in OBS's timestamped playout queue. */
   cameras[0].last_absolute_unix_ns = 101540000000ULL;
   cameras[0].playout_delay_ns = 1540000000ULL;
   cameras[1].last_absolute_unix_ns = 100000000000ULL;
