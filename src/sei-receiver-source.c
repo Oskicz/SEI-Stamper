@@ -776,7 +776,9 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     video_pts = packet->pts;
   int64_t pts_ns = video_pts;
   if (pts_ns == AV_NOPTS_VALUE)
-    pts_ns = os_gettime_ns();
+    pts_ns = source->decode_packet_receive_mono_ns
+                 ? (int64_t)source->decode_packet_receive_mono_ns
+                 : (int64_t)os_gettime_ns();
   else
     pts_ns = receiver_pts_to_ns(pts_ns, video_time_base.num,
                                 video_time_base.den);
@@ -1390,8 +1392,10 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       pts_ns = receiver_pts_to_ns(pts, tb.num, tb.den);
     } else {
       /* Keep un-timestamped audio on the established local clock. */
-      pts_ns = source->has_pts_offset ? (int64_t)os_gettime_ns() - source->pts_offset :
-                                      (int64_t)os_gettime_ns();
+      int64_t audio_receive_ns = (int64_t)audio_now_ns;
+      pts_ns = source->has_pts_offset
+                   ? audio_receive_ns - source->pts_offset
+                   : audio_receive_ns;
     }
 
     if (pts != AV_NOPTS_VALUE) {
