@@ -329,6 +329,15 @@ static inline bool receiver_keep_absolute_sync(bool has_absolute_anchor,
   return has_absolute_anchor && ntp_enabled && ntp_fresh;
 }
 
+/* A manual reset must not discard a healthy absolute clock. */
+static inline bool receiver_sync_reset_preserve_anchor(
+    bool connected, bool has_absolute_anchor, bool ntp_enabled, bool ntp_fresh)
+{
+  return connected &&
+         receiver_keep_absolute_sync(has_absolute_anchor, ntp_enabled,
+                                     ntp_fresh);
+}
+
 static inline bool receiver_monotonic_to_unix_ns(int64_t frame_mono_ns,
                                                   int64_t anchor_mono_ns,
                                                   int64_t anchor_unix_ns,

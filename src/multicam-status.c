@@ -227,11 +227,11 @@ uint64_t multicam_status_presentation_time_ns(
     const multicam_source_status_t *status)
 {
   if (!status || !status->last_absolute_unix_ns) return 0;
-  uint64_t capture_ns = status->last_absolute_unix_ns;
-  /* The filter outputs an older buffered frame: account for its hold time
-   * when estimating the capture instant currently on screen. */
-  return capture_ns > status->playout_delay_ns
-             ? capture_ns - status->playout_delay_ns : 0;
+  /* The newest decoded frame is still in OBS's timestamped future queue.
+   * Estimate the frame currently presented by accounting for the remaining
+   * source-specific playout wait. */
+  return status->last_absolute_unix_ns > status->playout_delay_ns
+             ? status->last_absolute_unix_ns - status->playout_delay_ns : 0;
 }
 
 uint64_t multicam_status_selected_scene_delay_ns(

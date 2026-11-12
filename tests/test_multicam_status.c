@@ -82,9 +82,15 @@ int main(void)
   if (multicam_status_group_aligned(cameras, 2, now, 16666667ULL, &spread) ||
       spread != 1540000000ULL) return 3;
   if (multicam_status_group_aligned(cameras, 2, now, 10000000ULL, NULL)) return 4;
-  cameras[1].playout_delay_ns = 1540000000ULL;
+  /* Newest decoded captures differ by the source waits; subtracting those
+   * waits estimates the same media time currently presented by OBS. */
+  cameras[0].last_absolute_unix_ns = 101540000000ULL;
+  cameras[0].playout_delay_ns = 1540000000ULL;
+  cameras[1].playout_delay_ns = 0;
   if (!multicam_status_group_aligned(cameras, 2, now, 16666667ULL, &spread) ||
       spread != 0) return 13;
+  cameras[0].last_absolute_unix_ns = 100000000000ULL;
+  cameras[0].playout_delay_ns = 0;
   const char *selected_names[] = {"Moblin Camera"};
   if (multicam_status_selected_scene_delay_ns(cameras, 2, selected_names, 1,
                                                now) != 2359000000ULL) return 15;
@@ -95,6 +101,15 @@ int main(void)
   if (multicam_status_selected_scene_delay_ns(cameras, 2, selected_names, 1,
                                                now) != 0) return 17;
   cameras[1].connected = true;
+  cameras[0].playout_delay_ns = 770000000ULL;
+  cameras[1].playout_delay_ns = 117000000ULL;
+  cameras[0].last_absolute_unix_ns = 100770000000ULL;
+  cameras[1].last_absolute_unix_ns = 100117000000ULL;
+  if (!multicam_status_group_aligned(cameras, 2, now, 16666667ULL, &spread) ||
+      spread != 0) return 20;
+  cameras[0].last_absolute_unix_ns = 100000000000ULL;
+  cameras[1].last_absolute_unix_ns = 101540000000ULL;
+  cameras[0].playout_delay_ns = 0;
   cameras[1].playout_delay_ns = 0;
   cameras[1].sync_method = MULTICAM_SYNC_PTS_FALLBACK;
   if (multicam_status_source_ready(&cameras[1], now)) return 5;

@@ -41,7 +41,7 @@ typedef struct multicam_source_status {
   uint64_t last_absolute_unix_ns;
   uint64_t observed_latency_ns;
   uint64_t sync_latency_ns;
-  uint64_t playout_delay_ns;
+  uint64_t playout_delay_ns; /* Remaining source-specific presentation wait. */
   uint64_t rx_bytes_total, rx_bitrate_bps;
   uint64_t rx_bitrate_5s_bps;
   int64_t video_offset_ns;

@@ -878,6 +878,12 @@ int main(void) {
               "stale NTP anchor falls back to PTS");
   ASSERT_TRUE(!receiver_keep_absolute_sync(true, false, true),
               "disabled NTP anchor falls back to PTS");
+  ASSERT_TRUE(receiver_sync_reset_preserve_anchor(true, true, true, true),
+              "manual reset preserves a connected fresh absolute clock");
+  ASSERT_TRUE(!receiver_sync_reset_preserve_anchor(true, true, true, false),
+              "manual reset can reacquire a stale absolute clock");
+  ASSERT_TRUE(!receiver_sync_reset_preserve_anchor(false, true, true, true),
+              "disconnected source does not preserve its previous clock");
   int64_t projected_unix_ns = 0;
   ASSERT_TRUE(receiver_monotonic_to_unix_ns(10500000000LL, 10000000000LL,
                                             1791986568000000000LL,

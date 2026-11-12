@@ -1947,17 +1947,27 @@ static void receiver_playout_queue_free_locked(sei_receiver_source_t *source)
   source->playout_queue_bytes = 0;
 }
 
-static void receiver_playout_pause_and_flush(sei_receiver_source_t *source)
+static void receiver_playout_pause(sei_receiver_source_t *source)
 {
   if (!source || !source->playout_queue_initialized)
     return;
   pthread_mutex_lock(&source->playout_queue_lock);
   source->playout_queue_paused = true;
-  receiver_playout_queue_free_locked(source);
   pthread_cond_broadcast(&source->playout_queue_changed);
   while (source->playout_worker_busy)
     pthread_cond_wait(&source->playout_queue_changed,
                       &source->playout_queue_lock);
+  pthread_mutex_unlock(&source->playout_queue_lock);
+}
+
+static void receiver_playout_pause_and_flush(sei_receiver_source_t *source)
+{
+  if (!source || !source->playout_queue_initialized)
+    return;
+  receiver_playout_pause(source);
+  pthread_mutex_lock(&source->playout_queue_lock);
+  receiver_playout_queue_free_locked(source);
+  pthread_cond_broadcast(&source->playout_queue_changed);
   pthread_mutex_unlock(&source->playout_queue_lock);
 }
 
@@ -2108,9 +2118,10 @@ static void *receiver_playout_thread(void *data)
 }
 
 /* Helper: tear down the connection's resources */
-static void cleanup_connection(sei_receiver_source_t *source) {
+static void cleanup_connection(sei_receiver_source_t *source,
+                               bool clear_video_now) {
   receiver_playout_pause_and_flush(source);
-  if (source->last_video_output_mono_ns)
+  if (clear_video_now && source->last_video_output_mono_ns)
     clear_output_video(source);
   if (source->format_context) {
     avformat_close_input((AVFormatContext **)&source->format_context);
@@ -2149,8 +2160,12 @@ static void cleanup_connection(sei_receiver_source_t *source) {
   source->first_ntp_time = 0;
   source->first_local_time = 0;
   source->last_video_pts_ns = AV_NOPTS_VALUE;
-  source->last_video_output_mono_ns = 0;
-  source->video_output_cleared = true;
+  if (clear_video_now && source->video_output_lock_initialized) {
+    pthread_mutex_lock(&source->video_output_lock);
+    source->last_video_output_mono_ns = 0;
+    source->video_output_cleared = true;
+    pthread_mutex_unlock(&source->video_output_lock);
+  }
   source->smoothed_input_latency_ns = 0;
   source->audio_pts_offset_ns = 0;
   source->audio_pts_offset_valid = false;
@@ -2392,37 +2407,61 @@ static void *srt_receive_thread(void *data) {
     source->reset_sync_requested = false;
     pthread_mutex_unlock(&source->audio_settings_lock);
 
+    bool preserve_live_anchor = false;
     if (reset_sync && !reset_picture) {
-      receiver_playout_pause_and_flush(source);
+      receiver_playout_pause(source);
+      bool ntp_fresh = source->ntp_enabled &&
+          !ntp_client_needs_resync(
+              &source->ntp_client,
+              receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
+      preserve_live_anchor = receiver_sync_reset_preserve_anchor(
+          source->is_connected,
+          source->has_pts_offset &&
+              source->absolute_sync_method != SYNC_METHOD_UNKNOWN,
+          source->ntp_enabled, ntp_fresh);
+      if (!preserve_live_anchor) {
+        pthread_mutex_lock(&source->playout_queue_lock);
+        receiver_playout_queue_free_locked(source);
+        pthread_cond_broadcast(&source->playout_queue_changed);
+        pthread_mutex_unlock(&source->playout_queue_lock);
+      }
     }
     if (reset_picture) {
       receiver_log(LOG_WARNING, source,
                    "Picture reset requested; reconnecting decoder and input");
-      cleanup_connection(source);
+      cleanup_connection(source, true);
     }
     if (reset_sync) {
-      source->has_pts_offset = false;
-      source->pts_offset = 0;
-      source->sync_method = SYNC_METHOD_UNKNOWN;
-      source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
-      source->last_video_pts_ns = AV_NOPTS_VALUE;
-      source->smoothed_input_latency_ns = 0;
-      source->audio_pts_offset_ns = 0;
-      source->audio_pts_offset_valid = false;
-      source->audio_output_clock.initialized = false;
-      source->audio_playout_speed = 1.0;
-      source->audio_speed_fractional_carry = 0.0;
-      source->last_audio_pts_ns = 0;
-      source->last_audio_pts_mono_ns = 0;
-      source->last_video_capture_time_ns = 0;
-      source->last_video_capture_mono_ns = 0;
-      source->audio_waiting_for_anchor_since_ns = 0;
-      multicam_status_set_sync_latency(source, 0);
-      multicam_status_set_playout_delay(source, 0);
-      receiver_log(LOG_INFO, source,
-                   "Synchronization reset requested; waiting for a fresh absolute timestamp");
-      if (source->is_connected)
+      if (preserve_live_anchor) {
+        receiver_log(LOG_INFO, source,
+                     "Sync refresh requested; preserving the live NTP and A/V clocks");
+        receiver_diagnostics_event(source, os_gettime_ns(),
+                                   "sync_refresh_preserved", 0, 0);
         receiver_playout_resume(source);
+      } else {
+        source->has_pts_offset = false;
+        source->pts_offset = 0;
+        source->sync_method = SYNC_METHOD_UNKNOWN;
+        source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
+        source->last_video_pts_ns = AV_NOPTS_VALUE;
+        source->smoothed_input_latency_ns = 0;
+        source->audio_pts_offset_ns = 0;
+        source->audio_pts_offset_valid = false;
+        source->audio_output_clock.initialized = false;
+        source->audio_playout_speed = 1.0;
+        source->audio_speed_fractional_carry = 0.0;
+        source->last_audio_pts_ns = 0;
+        source->last_audio_pts_mono_ns = 0;
+        source->last_video_capture_time_ns = 0;
+        source->last_video_capture_mono_ns = 0;
+        source->audio_waiting_for_anchor_since_ns = 0;
+        multicam_status_set_sync_latency(source, 0);
+        multicam_status_set_playout_delay(source, 0);
+        receiver_log(LOG_INFO, source,
+                     "Synchronization reset requested; waiting for a fresh absolute timestamp");
+        if (source->is_connected)
+          receiver_playout_resume(source);
+      }
     }
 
     /* 1. Not connected: try to connect */
@@ -2433,7 +2472,13 @@ static void *srt_receive_thread(void *data) {
       } else {
         /* connect failed; wait and retry */
         /* pthread_testcancel(); // Allow exit (Not supported in w32-pthreads) */
-        os_sleep_ms(2000);    // Sleep 2s
+        for (uint32_t waited_ms = 0;
+             waited_ms < VIDEO_STALE_TIMEOUT_NS / 1000000ULL &&
+             source->thread_active;
+             waited_ms += 100) {
+          clear_if_video_stale(source);
+          os_sleep_ms(100);
+        }
         continue;
       }
     }
@@ -2451,8 +2496,8 @@ static void *srt_receive_thread(void *data) {
         } else {
           receiver_log(LOG_WARNING, source, "Read Error: %d", ret);
         }
-        cleanup_connection(source);
-        continue; /* back to the top of the loop, triggering a reconnect */
+        cleanup_connection(source, false);
+        continue; /* retain last frame only until the 2 s stale timeout */
       }
 
       uint64_t receive_packet_ns = os_gettime_ns();
@@ -2473,7 +2518,7 @@ static void *srt_receive_thread(void *data) {
   }
 
   av_packet_free(&packet);
-  cleanup_connection(source);
+  cleanup_connection(source, true);
   receiver_log(LOG_INFO, source, "Thread stopped");
   return NULL;
 }
