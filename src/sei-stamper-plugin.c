@@ -15,6 +15,8 @@
 
 #include <obs-module.h>
 #include <util/platform.h>
+#include "sei-receiver-source.h"
+#include "multicam-sync-dock.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("sei-stamper", "en-US")
@@ -38,6 +40,7 @@ extern struct obs_source_info sei_receiver_source_info;
 
 // Module load
 bool obs_module_load(void) {
+  sei_receiver_diagnostics_init();
   blog(LOG_INFO, "SEI Stamper Plugin loaded");
 
   /* Register three independent SEI Stamper encoders, one per codec */
@@ -54,10 +57,17 @@ bool obs_module_load(void) {
   blog(LOG_INFO, "Registering SEI Receiver source");
   obs_register_source(&sei_receiver_source_info);
 
+  /* UI integration uses the OBS 32.2.2 frontend API and lives in its own
+   * C++/Qt translation unit; the receiver and audio decode stay in C. */
+  multicam_sync_dock_load();
+
   return true;
 }
 
 // Module unload
 void obs_module_unload(void) {
+  multicam_sync_dock_unload();
+  sei_receiver_diagnostics_shutdown();
   blog(LOG_INFO, "[SEI Stamper] Plugin unloaded");
 }
+

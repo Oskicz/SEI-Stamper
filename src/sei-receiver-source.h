@@ -8,10 +8,15 @@
 #pragma once
 
 #include "ntp-client.h"
+#include "receiver-time.h"
 #include "sei-handler.h"
 #include <libavcodec/avcodec.h> /* AVPacket */
+#include <libavutil/channel_layout.h>
 #include <obs-module.h>
+#include <time.h>
+#include <pthread.h>
 #include <util/threading.h> /* OBS threading API */
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,13 +32,21 @@ typedef enum {
   SYNC_STATE_SYNCHRONIZED /* synchronised */
 } sync_state_t;
 
+typedef enum {
+  SYNC_METHOD_UNKNOWN,
+  SYNC_METHOD_PTS_FALLBACK,
+  SYNC_METHOD_SEI_STAMPER_NTP,
+  SYNC_METHOD_MOBLIN_TIMECODE
+} sync_method_t;
+
 /* Video frame data */
 typedef struct video_frame_data {
   uint8_t *data;            /* frame data */
   size_t size;              /* data size */
-  int64_t pts;              /* presentation timestamp */
+  int64_t pts;              /* presentation timestamp in nanoseconds */
   ntp_timestamp_t ntp_time; /* NTP timestamp, extracted from the SEI */
   bool has_ntp;             /* whether an NTP timestamp is present */
+  sync_method_t timestamp_source; /* origin of this frame's absolute timestamp */
   uint32_t width;           /* video width */
   uint32_t height;          /* video height */
   enum video_format format; /* video format */
@@ -48,6 +61,14 @@ typedef struct frame_buffer {
   os_sem_t *semaphore;                         /* OBS semaphore */
 } frame_buffer_t;
 
+typedef struct receiver_queued_packet {
+  AVPacket *packet;
+  uint64_t received_mono_ns;
+  uint64_t release_mono_ns;
+  size_t bytes;
+  struct receiver_queued_packet *next;
+} receiver_queued_packet_t;
+
 /* SEI receiver source data */
 typedef struct sei_receiver_source {
   obs_source_t *context; /* OBS source context */
@@ -55,8 +76,39 @@ typedef struct sei_receiver_source {
   /* SRT connection */
   char srt_url[256];           /* SRT URL (may carry ?streamid=xxx etc.) */
   bool is_connected;           /* whether connected */
-  pthread_t receive_thread;    /* receive thread */
+  pthread_t receive_thread;    /* SRT demux thread */
+  pthread_t playout_thread;    /* ordered decode/output thread */
+  pthread_mutex_t playout_queue_lock;
+  pthread_mutex_t video_output_lock;
+  pthread_cond_t playout_queue_changed;
+  receiver_queued_packet_t *playout_queue_head;
+  receiver_queued_packet_t *playout_queue_tail;
+  size_t playout_queue_packets;
+  size_t playout_queue_bytes;
+  bool playout_queue_paused;
+  bool playout_worker_busy;
+  bool playout_thread_running;
+  bool playout_queue_initialized;
+  bool video_output_lock_initialized;
+  uint64_t playout_queue_drops;
+  uint64_t decode_packet_receive_mono_ns; /* current worker packet arrival */
   volatile bool thread_active; /* thread-active flag */
+  bool reset_sync_requested;
+  bool reset_picture_requested;
+  int64_t last_video_pts_ns;
+  uint64_t last_video_output_mono_ns;
+  uint64_t last_video_diagnostics_mono_ns;
+  uint64_t last_audio_diagnostics_mono_ns;
+  uint64_t last_event_diagnostics_mono_ns;
+  uint64_t diagnostic_source_id;
+  uint64_t video_pts_resets;
+  uint64_t audio_pts_resets;
+  uint64_t audio_decoder_recoveries;
+  bool video_output_cleared;
+  uint64_t smoothed_input_latency_ns;
+  receiver_audio_output_clock_t audio_output_clock;
+  double audio_playout_speed;
+  double audio_speed_fractional_carry;
 
   /* Video decode */
   void *format_context;       /* FFmpeg format context (demux) */
@@ -96,6 +148,15 @@ typedef struct sei_receiver_source {
   /* PTS sync */
   int64_t pts_offset;  /* PTS to SystemTime offset */
   bool has_pts_offset; /* whether the offset has been computed */
+  int64_t audio_pts_offset_ns; /* independent audio PTS epoch mapped to video */
+  bool audio_pts_offset_valid;
+  int64_t last_audio_pts_ns;
+  uint64_t last_audio_pts_mono_ns;
+  int64_t last_video_capture_time_ns;
+  uint64_t last_video_capture_mono_ns;
+  uint64_t audio_waiting_for_anchor_since_ns;
+  sync_method_t sync_method; /* actual timestamp source in use */
+  sync_method_t absolute_sync_method; /* last validated absolute timestamp source */
 
   /* Audio decode */
   void *audio_codec_context;      /* FFmpeg audio codec context */
@@ -103,11 +164,27 @@ typedef struct sei_receiver_source {
   enum audio_format audio_format; /* OBS audio format */
   uint32_t audio_channels;        /* channel count */
   uint32_t audio_sample_rate;     /* sample rate */
+  int64_t audio_offset_ns;        /* manual audio-to-video calibration */
+  void *audio_resampler;          /* SwrContext*: decoder -> OBS audio format */
+  pthread_mutex_t audio_settings_lock;
+  bool audio_settings_lock_initialized;
+  int audio_resampler_sample_fmt;
+  int audio_resampler_sample_rate;
+  AVChannelLayout audio_resampler_layout;
 
   /* Statistics */
   uint64_t frames_received;       /* total frames received */
   uint64_t frames_rendered;       /* total frames rendered */
   uint64_t frames_dropped;        /* frames dropped */
+  uint64_t decode_errors_total;   /* cumulative video decoder errors */
+  uint64_t audio_decode_errors_total;
+  uint32_t audio_decode_error_streak;
+  uint64_t audio_decoder_last_flush_ns;
+  uint64_t audio_frames_received; /* decoded audio frames output to OBS */
+  uint64_t rx_bytes_total;        /* demuxed packet bytes, cumulative */
+  uint64_t rx_bytes_window;       /* packet bytes since last bitrate sample */
+  uint64_t rx_bitrate_sample_ns;  /* monotonic sample time */
+  uint64_t rx_bitrate_bps;        /* measured receive bitrate */
   uint64_t sei_found_count;       /* frames where an SEI was found */
   uint64_t last_sync_frame_count; /* frame count at the last sync */
 
@@ -122,6 +199,12 @@ typedef struct sei_receiver_source {
   uint32_t decode_error_threshold; /* error threshold; reset once exceeded */
 
 } sei_receiver_source_t;
+
+/* Remove filters left by older plugin builds and recreate one managed filter
+ * for each loaded receiver. Call on the OBS UI thread after collection load. */
+void sei_receiver_cleanup_playout_filters(void);
+void sei_receiver_diagnostics_init(void);
+void sei_receiver_diagnostics_shutdown(void);
 
 /* Source plugin info */
 extern struct obs_source_info sei_receiver_source_info;
@@ -173,3 +256,4 @@ int64_t calculate_display_time(sei_receiver_source_t *source,
 #ifdef __cplusplus
 }
 #endif
+
