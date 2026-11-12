@@ -18,7 +18,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <time.h>
 
 /* FFmpeg Headers */
 #include <libavcodec/avcodec.h>
@@ -1014,11 +1013,11 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
     source->last_video_capture_time_ns = capture_display_time;
     source->last_video_capture_mono_ns = packet_receive_ns;
     if (source->last_audio_pts_mono_ns &&
-        status_now_ns >= source->last_audio_pts_mono_ns &&
-        status_now_ns - source->last_audio_pts_mono_ns <= 500000000ULL) {
+        packet_receive_ns >= source->last_audio_pts_mono_ns &&
+        packet_receive_ns - source->last_audio_pts_mono_ns <= 500000000ULL) {
       int64_t audio_offset_ns;
       if (receiver_audio_pts_anchor_offset_ns(
-              capture_display_time, status_now_ns, source->last_audio_pts_ns,
+              capture_display_time, packet_receive_ns, source->last_audio_pts_ns,
               source->last_audio_pts_mono_ns, &audio_offset_ns)) {
         bool first_audio_anchor = !source->audio_pts_offset_valid;
         source->audio_pts_offset_ns = first_audio_anchor
