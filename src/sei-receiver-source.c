@@ -1996,21 +1996,7 @@ static bool receiver_playout_enqueue(sei_receiver_source_t *source,
   }
   entry->received_mono_ns = received_mono_ns;
   entry->bytes = packet->size > 0 ? (size_t)packet->size : 0;
-
-  uint64_t input_latency_ns;
-  pthread_mutex_lock(&source->audio_settings_lock);
-  input_latency_ns = source->smoothed_input_latency_ns;
-  pthread_mutex_unlock(&source->audio_settings_lock);
-  double ignored_speed = 1.0;
-  uint64_t group_delay_ns =
-      multicam_status_group_playout_latency_ns(received_mono_ns,
-                                                &ignored_speed);
-  uint64_t wait_ns = receiver_packet_playout_wait_ns(
-      group_delay_ns, input_latency_ns, MAX_SYNC_PLAYOUT_DELAY_NS);
-  entry->release_mono_ns =
-      received_mono_ns > UINT64_MAX - wait_ns
-          ? UINT64_MAX
-          : received_mono_ns + wait_ns;
+  entry->release_mono_ns = received_mono_ns;
 
   pthread_mutex_lock(&source->playout_queue_lock);
   size_t remaining_bytes = source->playout_queue_bytes >= PLAYOUT_QUEUE_MAX_BYTES
@@ -2043,6 +2029,24 @@ static bool receiver_playout_enqueue(sei_receiver_source_t *source,
   pthread_cond_signal(&source->playout_queue_changed);
   pthread_mutex_unlock(&source->playout_queue_lock);
   return true;
+}
+
+/* Recalculate at every queue wake: latency and group target can change while
+ * this packet waits, especially after reconnect or bitrate/LLB transitions. */
+static void receiver_refresh_packet_release_deadline(
+    sei_receiver_source_t *source, receiver_queued_packet_t *entry,
+    uint64_t now_ns)
+{
+  uint64_t input_latency_ns;
+  pthread_mutex_lock(&source->audio_settings_lock);
+  input_latency_ns = source->smoothed_input_latency_ns;
+  pthread_mutex_unlock(&source->audio_settings_lock);
+  double ignored_speed = 1.0;
+  uint64_t group_delay_ns =
+      multicam_status_group_playout_latency_ns(now_ns, &ignored_speed);
+  entry->release_mono_ns = receiver_packet_playout_release_ns(
+      entry->received_mono_ns, group_delay_ns, input_latency_ns,
+      MAX_SYNC_PLAYOUT_DELAY_NS);
 }
 
 static void receiver_realtime_deadline_after(uint64_t wait_ns,
@@ -2078,6 +2082,7 @@ static void *receiver_playout_thread(void *data)
 
     receiver_queued_packet_t *entry = source->playout_queue_head;
     uint64_t now_ns = os_gettime_ns();
+    receiver_refresh_packet_release_deadline(source, entry, now_ns);
     if (entry->release_mono_ns > now_ns) {
       struct timespec deadline;
       receiver_realtime_deadline_after(entry->release_mono_ns - now_ns,
@@ -2407,24 +2412,19 @@ static void *srt_receive_thread(void *data) {
     source->reset_sync_requested = false;
     pthread_mutex_unlock(&source->audio_settings_lock);
 
-    bool preserve_live_anchor = false;
-    if (reset_sync && !reset_picture) {
-      receiver_playout_pause(source);
+    receiver_sync_reset_policy_t reset_policy = {0};
+    if (reset_sync) {
       bool ntp_fresh = source->ntp_enabled &&
           !ntp_client_needs_resync(
               &source->ntp_client,
               receiver_ntp_max_age_seconds(source->ntp_sync_interval_ms));
-      preserve_live_anchor = receiver_sync_reset_preserve_anchor(
-          source->is_connected,
+      reset_policy = receiver_sync_reset_policy(
+          source->is_connected && !reset_picture,
           source->has_pts_offset &&
               source->absolute_sync_method != SYNC_METHOD_UNKNOWN,
           source->ntp_enabled, ntp_fresh);
-      if (!preserve_live_anchor) {
-        pthread_mutex_lock(&source->playout_queue_lock);
-        receiver_playout_queue_free_locked(source);
-        pthread_cond_broadcast(&source->playout_queue_changed);
-        pthread_mutex_unlock(&source->playout_queue_lock);
-      }
+      if (!reset_picture && reset_policy.flush_playout)
+        receiver_playout_pause_and_flush(source);
     }
     if (reset_picture) {
       receiver_log(LOG_WARNING, source,
@@ -2432,19 +2432,26 @@ static void *srt_receive_thread(void *data) {
       cleanup_connection(source, true);
     }
     if (reset_sync) {
-      if (preserve_live_anchor) {
-        receiver_log(LOG_INFO, source,
-                     "Sync refresh requested; preserving the live NTP and A/V clocks");
+      int64_t previous_capture_ns = source->last_video_capture_time_ns;
+      int64_t previous_pts_offset_ns = source->pts_offset;
+      if (reset_policy.preserve_media_clock) {
         receiver_diagnostics_event(source, os_gettime_ns(),
-                                   "sync_refresh_preserved", 0, 0);
-        receiver_playout_resume(source);
+                                   "sync_refresh_queue_flushed",
+                                   previous_capture_ns,
+                                   previous_pts_offset_ns);
+        receiver_log(LOG_INFO, source,
+                     "Sync refresh requested; flushed queued packets and preserved the active NTP, A/V clocks, and audio cushion");
       } else {
         source->has_pts_offset = false;
         source->pts_offset = 0;
         source->sync_method = SYNC_METHOD_UNKNOWN;
         source->absolute_sync_method = SYNC_METHOD_UNKNOWN;
         source->last_video_pts_ns = AV_NOPTS_VALUE;
+        source->last_video_capture_time_ns = 0;
+        source->last_video_capture_mono_ns = 0;
+        pthread_mutex_lock(&source->audio_settings_lock);
         source->smoothed_input_latency_ns = 0;
+        pthread_mutex_unlock(&source->audio_settings_lock);
         source->audio_pts_offset_ns = 0;
         source->audio_pts_offset_valid = false;
         source->audio_output_clock.initialized = false;
@@ -2452,16 +2459,17 @@ static void *srt_receive_thread(void *data) {
         source->audio_speed_fractional_carry = 0.0;
         source->last_audio_pts_ns = 0;
         source->last_audio_pts_mono_ns = 0;
-        source->last_video_capture_time_ns = 0;
-        source->last_video_capture_mono_ns = 0;
         source->audio_waiting_for_anchor_since_ns = 0;
-        multicam_status_set_sync_latency(source, 0);
-        multicam_status_set_playout_delay(source, 0);
+        receiver_diagnostics_event(source, os_gettime_ns(),
+                                   "sync_reset_reacquire",
+                                   previous_capture_ns,
+                                   previous_pts_offset_ns);
         receiver_log(LOG_INFO, source,
-                     "Synchronization reset requested; waiting for a fresh absolute timestamp");
-        if (source->is_connected)
-          receiver_playout_resume(source);
+                     "Synchronization reset requested; media clocks cleared and awaiting a fresh absolute timestamp");
+        multicam_status_invalidate_sync(source);
       }
+      if (reset_policy.preserve_transport)
+        receiver_playout_resume(source);
     }
 
     /* 1. Not connected: try to connect */

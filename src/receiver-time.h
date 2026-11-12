@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 5037)
+Total output lines: 504
+
 #pragma once
 
 #include <stdint.h>
@@ -111,8 +114,6 @@ static inline uint64_t receiver_group_delay_step(
     return control->applied_ns;
   }
   if (now_ns < control->last_update_ns) {
-    control->last_update_ns = now_ns;
-    control->speed = 1.0;
     if (playout_speed) *playout_speed = control->speed;
     return control->applied_ns;
   }
@@ -250,9 +251,7 @@ static inline bool receiver_add_signed_ns(int64_t timestamp_ns,
 static inline int64_t receiver_smooth_audio_pts_offset_ns(int64_t current_ns,
                                                            int64_t target_ns)
 {
-  long double next = (long double)current_ns +
-                     ((long double)target_ns - (long double)current_ns) / 16.0L;
-  if (next > (long double)INT64_MAX) return INT64_MAX;
+  lon…37 tokens truncated…le)INT64_MAX) return INT64_MAX;
   if (next < (long double)INT64_MIN) return INT64_MIN;
   return (int64_t)(next >= 0 ? next + 0.5L : next - 0.5L);
 }
@@ -329,13 +328,27 @@ static inline bool receiver_keep_absolute_sync(bool has_absolute_anchor,
   return has_absolute_anchor && ntp_enabled && ntp_fresh;
 }
 
-/* A manual reset must not discard a healthy absolute clock. */
-static inline bool receiver_sync_reset_preserve_anchor(
+typedef struct receiver_sync_reset_policy {
+  bool preserve_transport;
+  bool preserve_media_clock;
+  bool flush_playout;
+  bool reacquire_absolute_clock;
+} receiver_sync_reset_policy_t;
+
+/* A manual sync reset should repair stale queued pacing without needlessly
+ * reconnecting a healthy SRT stream or jumping its current A/V clocks. */
+static inline receiver_sync_reset_policy_t receiver_sync_reset_policy(
     bool connected, bool has_absolute_anchor, bool ntp_enabled, bool ntp_fresh)
 {
-  return connected &&
-         receiver_keep_absolute_sync(has_absolute_anchor, ntp_enabled,
-                                     ntp_fresh);
+  receiver_sync_reset_policy_t policy = {
+    .preserve_transport = connected,
+    .preserve_media_clock = connected &&
+        receiver_keep_absolute_sync(has_absolute_anchor, ntp_enabled,
+                                    ntp_fresh),
+    .flush_playout = true,
+    .reacquire_absolute_clock = true,
+  };
+  return policy;
 }
 
 static inline bool receiver_monotonic_to_unix_ns(int64_t frame_mono_ns,
@@ -440,6 +453,16 @@ static inline uint64_t receiver_packet_playout_wait_ns(uint64_t group_delay_ns,
   return wait_ns > max_wait_ns ? max_wait_ns : wait_ns;
 }
 
+static inline uint64_t receiver_packet_playout_release_ns(
+    uint64_t received_mono_ns, uint64_t group_delay_ns,
+    uint64_t input_latency_ns, uint64_t max_wait_ns)
+{
+  uint64_t wait_ns = receiver_packet_playout_wait_ns(
+      group_delay_ns, input_latency_ns, max_wait_ns);
+  return wait_ns > UINT64_MAX - received_mono_ns
+             ? UINT64_MAX : received_mono_ns + wait_ns;
+}
+
 /* Apply a user calibration to an already mapped OBS monotonic timestamp.
  * Positive offset delays audio; negative offset advances it. */
 static inline uint64_t receiver_audio_timestamp_with_offset(int64_t timestamp_ns,
@@ -478,4 +501,5 @@ static inline uint32_t receiver_ntp_max_age_seconds(uint32_t sync_interval_ms)
   if (max_age > 3600ULL) max_age = 3600ULL;
   return (uint32_t)max_age;
 }
+
 

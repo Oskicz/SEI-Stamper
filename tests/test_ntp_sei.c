@@ -837,6 +837,24 @@ static void test_group_delay_slews_without_jumps(void)
   }
 }
 
+static void test_group_delay_ignores_out_of_order_clock_updates(void)
+{
+  printf("  out-of-order queue timestamps do not reset the active playout speed...\\n");
+  receiver_group_delay_control_t control = {0};
+  double speed = 1.0;
+  receiver_group_delay_step(&control, 1500000000ULL, 1000000000ULL, &speed);
+  receiver_group_delay_step(&control, 2000000000ULL, 1100000000ULL, &speed);
+  ASSERT_TRUE(speed < 1.0, "a larger target enters smooth slow-down");
+  uint64_t applied_before_stale_update = control.applied_ns;
+  double speed_before_stale_update = speed;
+  uint64_t applied = receiver_group_delay_step(
+      &control, 2000000000ULL, 1050000000ULL, &speed);
+  ASSERT_EQ(applied, applied_before_stale_update,
+            "an out-of-order arrival timestamp cannot move the common delay");
+  ASSERT_TRUE(speed == speed_before_stale_update,
+              "an out-of-order arrival timestamp cannot snap audio correction to unity");
+}
+
 static void test_audio_output_clock_and_slowdown_capacity(void)
 {
   printf("  sample clock stays continuous and slow-down fits allocated audio...\n");
@@ -878,12 +896,22 @@ int main(void) {
               "stale NTP anchor falls back to PTS");
   ASSERT_TRUE(!receiver_keep_absolute_sync(true, false, true),
               "disabled NTP anchor falls back to PTS");
-  ASSERT_TRUE(receiver_sync_reset_preserve_anchor(true, true, true, true),
-              "manual reset preserves a connected fresh absolute clock");
-  ASSERT_TRUE(!receiver_sync_reset_preserve_anchor(true, true, true, false),
-              "manual reset can reacquire a stale absolute clock");
-  ASSERT_TRUE(!receiver_sync_reset_preserve_anchor(false, true, true, true),
-              "disconnected source does not preserve its previous clock");
+  receiver_sync_reset_policy_t reset_policy =
+      receiver_sync_reset_policy(true, true, true, true);
+  ASSERT_TRUE(reset_policy.preserve_transport && reset_policy.preserve_media_clock &&
+                  reset_policy.flush_playout &&
+                  reset_policy.reacquire_absolute_clock,
+              "manual reset keeps a healthy connection but flushes stale pacing and reacquires its clock");
+  reset_policy = receiver_sync_reset_policy(false, true, true, true);
+  ASSERT_TRUE(!reset_policy.preserve_transport && !reset_policy.preserve_media_clock &&
+                  reset_policy.flush_playout &&
+                  reset_policy.reacquire_absolute_clock,
+              "disconnected reset clears queued state and waits for a new anchor");
+  reset_policy = receiver_sync_reset_policy(true, true, true, false);
+  ASSERT_TRUE(reset_policy.preserve_transport && !reset_policy.preserve_media_clock &&
+                  reset_policy.flush_playout &&
+                  reset_policy.reacquire_absolute_clock,
+              "stale NTP reset keeps SRT connected but clears the stale clock");
   int64_t projected_unix_ns = 0;
   ASSERT_TRUE(receiver_monotonic_to_unix_ns(10500000000LL, 10000000000LL,
                                             1791986568000000000LL,
@@ -942,11 +970,23 @@ int main(void) {
   ASSERT_EQ(receiver_packet_playout_wait_ns(5000000000ULL, 1000000000ULL,
                                              2000000000ULL),
             2000000000ULL, "source packet wait never exceeds its safety bound");
+  uint64_t packet_arrival_ns = 10000000000ULL;
+  uint64_t initial_release_ns = receiver_packet_playout_release_ns(
+      packet_arrival_ns, 4380000000ULL, 2600000000ULL, 2000000000ULL);
+  uint64_t corrected_release_ns = receiver_packet_playout_release_ns(
+      packet_arrival_ns, 4380000000ULL, 4200000000ULL, 2000000000ULL);
+  ASSERT_EQ(initial_release_ns, 11780000000ULL,
+            "packet deadline initially reflects the measured source wait");
+  ASSERT_EQ(corrected_release_ns, 10180000000ULL,
+            "queued packet deadline can move when reconnect latency is remeasured");
+  ASSERT_TRUE(corrected_release_ns < initial_release_ns,
+              "stale queued packets do not keep the old latency correction");
   test_playout_timestamps_use_common_latency();
   test_playout_delay_updates_are_stable();
   test_group_playout_target_covers_latency_and_bounds_wait();
   test_group_delay_speed_curve();
   test_group_delay_slews_without_jumps();
+  test_group_delay_ignores_out_of_order_clock_updates();
   test_audio_output_clock_and_slowdown_capacity();
   test_ntp_sanity_check();
 

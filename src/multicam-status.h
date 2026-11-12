@@ -87,6 +87,7 @@ uint64_t multicam_status_group_playout_latency_ns(uint64_t now_ns,
                                                    double *playout_speed);
 void multicam_status_set_playout_delay(void *key, uint64_t delay_ns);
 void multicam_status_set_sync_latency(void *key, uint64_t latency_ns);
+void multicam_status_invalidate_sync(void *key);
 
 #ifdef __cplusplus
 }

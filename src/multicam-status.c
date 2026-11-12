@@ -372,3 +372,20 @@ void multicam_status_set_sync_latency(void *key, uint64_t latency_ns)
   pthread_mutex_unlock(&status_lock);
 }
 
+void multicam_status_invalidate_sync(void *key)
+{
+  pthread_mutex_lock(&status_lock);
+  status_slot_t *slot = find_slot(key);
+  if (slot) {
+    slot->value.ntp_fresh = false;
+    slot->value.sync_method = MULTICAM_SYNC_UNKNOWN;
+    slot->value.last_video_mono_ns = 0;
+    slot->value.last_audio_mono_ns = 0;
+    slot->value.last_absolute_unix_ns = 0;
+    slot->value.observed_latency_ns = 0;
+    slot->value.sync_latency_ns = 0;
+    slot->value.playout_delay_ns = 0;
+  }
+  pthread_mutex_unlock(&status_lock);
+}
+

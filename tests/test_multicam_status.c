@@ -31,6 +31,15 @@ int main(void)
   multicam_status_set_playout_delay(&key, 1250000000ULL);
   if (multicam_status_snapshot(&measured, 1) != 1 ||
       measured.playout_delay_ns != 1250000000ULL) return 14;
+  multicam_status_invalidate_sync(&key);
+  if (multicam_status_snapshot(&measured, 1) != 1 || !measured.connected ||
+      measured.ntp_fresh || measured.last_absolute_unix_ns ||
+      measured.sync_latency_ns || measured.playout_delay_ns ||
+      measured.last_packet_mono_ns != 2000000000ULL) return 21;
+  double reset_speed = 0.0;
+  if (multicam_status_group_playout_latency_ns(2000000000ULL,
+                                               &reset_speed) != 0 ||
+      reset_speed != 1.0) return 22;
   multicam_status_set_audio_decode_errors(&key, 3);
   if (multicam_status_snapshot(&measured, 1) != 1 ||
       measured.audio_decode_errors != 3) return 9;
