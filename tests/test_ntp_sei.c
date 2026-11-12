@@ -923,6 +923,19 @@ int main(void) {
   test_ntp_sync_anchor_is_offset_corrected();
   test_audio_pts_epoch_is_anchored_to_video_capture_clock();
   test_audio_decoder_recovery_threshold();
+  ASSERT_EQ(receiver_packet_playout_wait_ns(4200000000ULL, 2700000000ULL,
+                                             2000000000ULL),
+            1500000000ULL,
+            "compressed packets wait only for the per-source playout gap");
+  ASSERT_EQ(receiver_packet_playout_wait_ns(4200000000ULL, 5000000000ULL,
+                                             2000000000ULL),
+            0ULL, "late sources are never delayed further");
+  ASSERT_EQ(receiver_packet_playout_wait_ns(5000000000ULL, 0,
+                                             2000000000ULL),
+            0ULL, "first packet is decoded immediately to establish latency");
+  ASSERT_EQ(receiver_packet_playout_wait_ns(5000000000ULL, 1000000000ULL,
+                                             2000000000ULL),
+            2000000000ULL, "source packet wait never exceeds its safety bound");
   test_playout_timestamps_use_common_latency();
   test_playout_delay_updates_are_stable();
   test_group_playout_target_covers_latency_and_bounds_wait();

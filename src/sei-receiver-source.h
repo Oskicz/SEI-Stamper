@@ -13,6 +13,8 @@
 #include <libavcodec/avcodec.h> /* AVPacket */
 #include <libavutil/channel_layout.h>
 #include <obs-module.h>
+#include <time.h>
+#include <pthread.h>
 #include <util/threading.h> /* OBS threading API */
 
 
@@ -59,6 +61,14 @@ typedef struct frame_buffer {
   os_sem_t *semaphore;                         /* OBS semaphore */
 } frame_buffer_t;
 
+typedef struct receiver_queued_packet {
+  AVPacket *packet;
+  uint64_t received_mono_ns;
+  uint64_t release_mono_ns;
+  size_t bytes;
+  struct receiver_queued_packet *next;
+} receiver_queued_packet_t;
+
 /* SEI receiver source data */
 typedef struct sei_receiver_source {
   obs_source_t *context; /* OBS source context */
@@ -66,7 +76,22 @@ typedef struct sei_receiver_source {
   /* SRT connection */
   char srt_url[256];           /* SRT URL (may carry ?streamid=xxx etc.) */
   bool is_connected;           /* whether connected */
-  pthread_t receive_thread;    /* receive thread */
+  pthread_t receive_thread;    /* SRT demux thread */
+  pthread_t playout_thread;    /* ordered decode/output thread */
+  pthread_mutex_t playout_queue_lock;
+  pthread_mutex_t video_output_lock;
+  pthread_cond_t playout_queue_changed;
+  receiver_queued_packet_t *playout_queue_head;
+  receiver_queued_packet_t *playout_queue_tail;
+  size_t playout_queue_packets;
+  size_t playout_queue_bytes;
+  bool playout_queue_paused;
+  bool playout_worker_busy;
+  bool playout_thread_running;
+  bool playout_queue_initialized;
+  bool video_output_lock_initialized;
+  uint64_t playout_queue_drops;
+  uint64_t decode_packet_receive_mono_ns; /* current worker packet arrival */
   volatile bool thread_active; /* thread-active flag */
   bool reset_sync_requested;
   bool reset_picture_requested;

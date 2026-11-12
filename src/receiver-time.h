@@ -412,6 +412,25 @@ static inline bool receiver_ntp_to_monotonic_ns(uint32_t frame_seconds,
   return true;
 }
 
+/* Compute how long a compressed packet must be held before decoding so OBS
+ * receives it near its target timestamp instead of buffering seconds of future
+ * frames in its bounded async queue. */
+static inline uint64_t receiver_packet_playout_wait_ns(uint64_t group_delay_ns,
+                                                       uint64_t input_latency_ns,
+                                                       uint64_t max_wait_ns)
+{
+  /* No observed latency means this source has not supplied its first
+   * absolute timestamp yet. Decode the first anchor immediately; delaying it
+   * by another source's group target would make it late when the estimate
+   * becomes available. */
+  if (!input_latency_ns)
+    return 0;
+  uint64_t wait_ns = group_delay_ns > input_latency_ns
+                         ? group_delay_ns - input_latency_ns
+                         : 0;
+  return wait_ns > max_wait_ns ? max_wait_ns : wait_ns;
+}
+
 /* Apply a user calibration to an already mapped OBS monotonic timestamp.
  * Positive offset delays audio; negative offset advances it. */
 static inline uint64_t receiver_audio_timestamp_with_offset(int64_t timestamp_ns,

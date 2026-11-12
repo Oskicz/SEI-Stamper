@@ -17,6 +17,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <time.h>
 
 /* FFmpeg Headers */
 #include <libavcodec/avcodec.h>
@@ -44,6 +46,8 @@
 #define VIDEO_STALE_TIMEOUT_NS 2000000000ULL
 #define PTS_BACKWARD_RESET_NS 500000000ULL
 #define MAX_SYNC_PLAYOUT_DELAY_NS 2000000000ULL
+#define PLAYOUT_QUEUE_MAX_PACKETS 512U
+#define PLAYOUT_QUEUE_MAX_BYTES (32U * 1024U * 1024U)
 #define RECEIVER_DIAGNOSTICS_INTERVAL_NS 10000000000ULL
 #define RECEIVER_DIAGNOSTICS_MAX_BYTES (1024U * 1024U)
 #define RECEIVER_DIAGNOSTICS_BACKUPS 2U
@@ -132,6 +136,10 @@ static void receiver_diagnostics_video_sample(
                      source->last_video_diagnostics_mono_ns, now_ns))
     return;
   source->last_video_diagnostics_mono_ns = now_ns;
+  pthread_mutex_lock(&source->audio_settings_lock);
+  uint64_t rx_bitrate_bps = source->rx_bitrate_bps;
+  uint64_t input_latency_ns = source->smoothed_input_latency_ns;
+  pthread_mutex_unlock(&source->audio_settings_lock);
   double output_lead_ms = ((double)output_pts_ns - (double)now_ns) / 1000000.0;
   char line[512];
   snprintf(line, sizeof(line),
@@ -140,15 +148,15 @@ static void receiver_diagnostics_video_sample(
       (unsigned long long)now_ns, (int)source->sync_method,
       ntp_fresh ? "true" : "false", (long long)input_pts_ns,
       (unsigned long long)output_pts_ns, output_lead_ms,
-      (double)source->smoothed_input_latency_ns / 1000000.0,
-      (double)((group_delay_ns > source->smoothed_input_latency_ns &&
+      (double)input_latency_ns / 1000000.0,
+      (double)((group_delay_ns > input_latency_ns &&
                 (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP ||
                  source->sync_method == SYNC_METHOD_MOBLIN_TIMECODE))
-                   ? group_delay_ns - source->smoothed_input_latency_ns : 0) /
+                   ? group_delay_ns - input_latency_ns : 0) /
           1000000.0,
       (double)group_delay_ns / 1000000.0, speed,
       (double)source->current_fps,
-      (unsigned long long)source->rx_bitrate_bps,
+      (unsigned long long)rx_bitrate_bps,
       (unsigned long long)source->decode_errors_total,
       (unsigned long long)source->video_pts_resets);
   receiver_diagnostics_write(source, line);
@@ -163,6 +171,9 @@ static void receiver_diagnostics_audio_sample(
                      source->last_audio_diagnostics_mono_ns, now_ns))
     return;
   source->last_audio_diagnostics_mono_ns = now_ns;
+  pthread_mutex_lock(&source->audio_settings_lock);
+  uint64_t rx_bitrate_bps = source->rx_bitrate_bps;
+  pthread_mutex_unlock(&source->audio_settings_lock);
   double output_lead_ms = ((double)output_pts_ns - (double)now_ns) / 1000000.0;
   char line[512];
   snprintf(line, sizeof(line),
@@ -172,7 +183,7 @@ static void receiver_diagnostics_audio_sample(
       input_samples, output_samples, (unsigned long long)output_pts_ns,
       output_lead_ms, (double)source->audio_pts_offset_ns / 1000000.0,
       (double)group_delay_ns / 1000000.0, speed,
-      (unsigned long long)source->rx_bitrate_bps,
+      (unsigned long long)rx_bitrate_bps,
       (unsigned long long)source->audio_decode_errors_total,
       (unsigned long long)source->audio_pts_resets,
       (unsigned long long)source->audio_decoder_recoveries);
@@ -539,10 +550,16 @@ static void record_audio_decode_error(sei_receiver_source_t *source)
 
 static void clear_output_video(sei_receiver_source_t *source)
 {
-  if (!source || !source->context || source->video_output_cleared)
+  if (!source || !source->context || !source->video_output_lock_initialized)
     return;
+  pthread_mutex_lock(&source->video_output_lock);
+  if (source->video_output_cleared) {
+    pthread_mutex_unlock(&source->video_output_lock);
+    return;
+  }
   obs_source_output_video(source->context, NULL);
   source->video_output_cleared = true;
+  pthread_mutex_unlock(&source->video_output_lock);
   receiver_log(LOG_INFO, source,
                "Cleared stale video output after 2 seconds without decoded frames");
 }
@@ -558,11 +575,16 @@ static int interrupt_if_video_stale(void *opaque)
     if (reset_requested)
       return 1;
   }
-  if (!source || !source->thread_active || !source->last_video_output_mono_ns ||
-      source->video_output_cleared)
+  if (!source || !source->thread_active)
+    return 0;
+  pthread_mutex_lock(&source->video_output_lock);
+  uint64_t last_output_ns = source->last_video_output_mono_ns;
+  bool cleared = source->video_output_cleared;
+  pthread_mutex_unlock(&source->video_output_lock);
+  if (!last_output_ns || cleared)
     return 0;
   uint64_t now = os_gettime_ns();
-  if (receiver_video_is_stale(source->last_video_output_mono_ns, now,
+  if (receiver_video_is_stale(last_output_ns, now,
                               VIDEO_STALE_TIMEOUT_NS)) {
     clear_output_video(source);
     return 1;
@@ -638,11 +660,15 @@ void sei_receiver_cleanup_playout_filters(void)
 
 static void clear_if_video_stale(sei_receiver_source_t *source)
 {
-  if (!source || source->video_output_cleared ||
-      !source->last_video_output_mono_ns)
+  if (!source || !source->video_output_lock_initialized)
     return;
-  if (receiver_video_is_stale(source->last_video_output_mono_ns,
-                              os_gettime_ns(), VIDEO_STALE_TIMEOUT_NS))
+  pthread_mutex_lock(&source->video_output_lock);
+  uint64_t last_output_ns = source->last_video_output_mono_ns;
+  bool cleared = source->video_output_cleared;
+  pthread_mutex_unlock(&source->video_output_lock);
+  if (!cleared && last_output_ns &&
+      receiver_video_is_stale(last_output_ns, os_gettime_ns(),
+                              VIDEO_STALE_TIMEOUT_NS))
     clear_output_video(source);
 }
 
@@ -931,6 +957,9 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
   int64_t current_unix_ns = 0;
   uint64_t observed_latency_ns = 0;
   uint64_t status_now_ns = os_gettime_ns();
+  uint64_t packet_receive_ns = source->decode_packet_receive_mono_ns
+                                   ? source->decode_packet_receive_mono_ns
+                                   : status_now_ns;
   bool ntp_fresh = false;
   multicam_status_sync_method_t status_method = MULTICAM_SYNC_PTS_FALLBACK;
   if (source->sync_method == SYNC_METHOD_SEI_STAMPER_NTP)
@@ -964,9 +993,17 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
           ntp_fresh = false;
         }
       }
-      if (ntp_fresh && have_current_time && absolute_unix_ns > 0 &&
-          current_unix_ns > absolute_unix_ns)
-        observed_latency_ns = (uint64_t)(current_unix_ns - absolute_unix_ns);
+      int64_t packet_receive_unix_ns = current_unix_ns;
+      if (ntp_fresh && have_current_time &&
+          packet_receive_ns <= (uint64_t)INT64_MAX &&
+          status_now_ns <= (uint64_t)INT64_MAX)
+        receiver_monotonic_to_unix_ns((int64_t)packet_receive_ns,
+                                      (int64_t)status_now_ns,
+                                      current_unix_ns,
+                                      &packet_receive_unix_ns);
+      if (ntp_fresh && packet_receive_unix_ns > absolute_unix_ns)
+        observed_latency_ns =
+            (uint64_t)(packet_receive_unix_ns - absolute_unix_ns);
     }
   }
   multicam_status_video(source, status_method, ntp_fresh, absolute_unix_ns,
@@ -975,7 +1012,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
                         status_now_ns);
   if (ntp_fresh && absolute_unix_ns > 0) {
     source->last_video_capture_time_ns = capture_display_time;
-    source->last_video_capture_mono_ns = status_now_ns;
+    source->last_video_capture_mono_ns = packet_receive_ns;
     if (source->last_audio_pts_mono_ns &&
         status_now_ns >= source->last_audio_pts_mono_ns &&
         status_now_ns - source->last_audio_pts_mono_ns <= 500000000ULL) {
@@ -1000,6 +1037,7 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
         }
       }
     }
+    pthread_mutex_lock(&source->audio_settings_lock);
     if (!source->smoothed_input_latency_ns) {
       source->smoothed_input_latency_ns = observed_latency_ns;
     } else if (observed_latency_ns >= source->smoothed_input_latency_ns) {
@@ -1009,8 +1047,9 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
       source->smoothed_input_latency_ns -=
           (source->smoothed_input_latency_ns - observed_latency_ns) / 8;
     }
-    multicam_status_set_sync_latency(source,
-                                     source->smoothed_input_latency_ns);
+    uint64_t smoothed_latency_ns = source->smoothed_input_latency_ns;
+    pthread_mutex_unlock(&source->audio_settings_lock);
+    multicam_status_set_sync_latency(source, smoothed_latency_ns);
   }
 
   /* The shared delay state changes at a bounded rate. This avoids timestamp
@@ -1035,13 +1074,15 @@ bool decode_and_extract_sei(sei_receiver_source_t *source, AVPacket *packet,
       obs_frame.timestamp, group_playout_latency_ns);
 
   /* Push the frame to OBS */
+  pthread_mutex_lock(&source->video_output_lock);
   obs_source_output_video(source->context, &obs_frame);
+  source->last_video_output_mono_ns = os_gettime_ns();
+  source->video_output_cleared = false;
+  pthread_mutex_unlock(&source->video_output_lock);
   receiver_diagnostics_video_sample(source, status_now_ns, frame_out->pts,
                                     obs_frame.timestamp, ntp_fresh,
                                     group_playout_latency_ns,
                                     group_playout_speed);
-  source->last_video_output_mono_ns = os_gettime_ns();
-  source->video_output_cleared = false;
 
   /* Update the statistics */
   update_statistics(source);
@@ -1218,10 +1259,13 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
       continue;
     }
 
-    uint64_t audio_now_ns = os_gettime_ns();
+    uint64_t audio_now_ns = source->decode_packet_receive_mono_ns
+                                ? source->decode_packet_receive_mono_ns
+                                : os_gettime_ns();
+    uint64_t audio_output_now_ns = os_gettime_ns();
     double group_playout_speed = 1.0;
     uint64_t group_playout_latency_ns =
-        multicam_status_group_playout_latency_ns(audio_now_ns,
+        multicam_status_group_playout_latency_ns(audio_output_now_ns,
                                                   &group_playout_speed);
     source->audio_playout_speed = group_playout_speed;
 
@@ -1422,11 +1466,11 @@ bool decode_audio(sei_receiver_source_t *source, AVPacket *packet) {
           &source->audio_output_clock, (uint32_t)converted_samples);
       obs_source_output_audio(source->context, &audio);
       receiver_diagnostics_audio_sample(
-          source, audio_now_ns, frame->format, audio.format, frame->nb_samples,
+          source, audio_output_now_ns, frame->format, audio.format, frame->nb_samples,
           converted_samples, audio.timestamp, group_playout_latency_ns,
           group_playout_speed);
     }
-    multicam_status_audio(source, audio_now_ns);
+    multicam_status_audio(source, audio_output_now_ns);
     av_freep(&converted[0]);
     av_freep(&converted);
     av_frame_unref(frame);
@@ -1478,6 +1522,33 @@ static void *receiver_source_create(obs_data_t *settings,
     return NULL;
   }
   ctx->audio_settings_lock_initialized = true;
+  if (pthread_mutex_init(&ctx->playout_queue_lock, NULL) != 0) {
+    pthread_mutex_destroy(&ctx->audio_settings_lock);
+    ctx->audio_settings_lock_initialized = false;
+    frame_buffer_destroy(&ctx->frame_buffer);
+    bfree(ctx);
+    return NULL;
+  }
+  if (pthread_cond_init(&ctx->playout_queue_changed, NULL) != 0) {
+    pthread_mutex_destroy(&ctx->playout_queue_lock);
+    pthread_mutex_destroy(&ctx->audio_settings_lock);
+    ctx->audio_settings_lock_initialized = false;
+    frame_buffer_destroy(&ctx->frame_buffer);
+    bfree(ctx);
+    return NULL;
+  }
+  if (pthread_mutex_init(&ctx->video_output_lock, NULL) != 0) {
+    pthread_cond_destroy(&ctx->playout_queue_changed);
+    pthread_mutex_destroy(&ctx->playout_queue_lock);
+    pthread_mutex_destroy(&ctx->audio_settings_lock);
+    ctx->audio_settings_lock_initialized = false;
+    frame_buffer_destroy(&ctx->frame_buffer);
+    bfree(ctx);
+    return NULL;
+  }
+  ctx->playout_queue_initialized = true;
+  ctx->video_output_lock_initialized = true;
+  ctx->playout_queue_paused = true;
   multicam_status_register(ctx, obs_source_get_name(source));
 
   /* Initialise the sync state */
@@ -1586,6 +1657,16 @@ static void receiver_source_destroy(void *data) {
     AVCodecContext *actx = (AVCodecContext *)ctx->audio_codec_context;
     avcodec_free_context(&actx);
     ctx->audio_codec_context = NULL;
+  }
+
+  if (ctx->playout_queue_initialized) {
+    pthread_cond_destroy(&ctx->playout_queue_changed);
+    pthread_mutex_destroy(&ctx->playout_queue_lock);
+    ctx->playout_queue_initialized = false;
+  }
+  if (ctx->video_output_lock_initialized) {
+    pthread_mutex_destroy(&ctx->video_output_lock);
+    ctx->video_output_lock_initialized = false;
   }
 
   /* Destroy the NTP client */
@@ -1846,8 +1927,186 @@ static void receiver_source_update(void *data, obs_data_t *settings) {
 
   receiver_log(LOG_INFO, ctx, "Settings updated");
 }
+bool decode_audio(sei_receiver_source_t *source, AVPacket *packet);
+
+static void receiver_playout_queue_free_locked(sei_receiver_source_t *source)
+{
+  receiver_queued_packet_t *entry = source->playout_queue_head;
+  while (entry) {
+    receiver_queued_packet_t *next = entry->next;
+    av_packet_free(&entry->packet);
+    bfree(entry);
+    entry = next;
+  }
+  source->playout_queue_head = NULL;
+  source->playout_queue_tail = NULL;
+  source->playout_queue_packets = 0;
+  source->playout_queue_bytes = 0;
+}
+
+static void receiver_playout_pause_and_flush(sei_receiver_source_t *source)
+{
+  if (!source || !source->playout_queue_initialized)
+    return;
+  pthread_mutex_lock(&source->playout_queue_lock);
+  source->playout_queue_paused = true;
+  receiver_playout_queue_free_locked(source);
+  pthread_cond_broadcast(&source->playout_queue_changed);
+  while (source->playout_worker_busy)
+    pthread_cond_wait(&source->playout_queue_changed,
+                      &source->playout_queue_lock);
+  pthread_mutex_unlock(&source->playout_queue_lock);
+}
+
+static void receiver_playout_resume(sei_receiver_source_t *source)
+{
+  if (!source || !source->playout_queue_initialized)
+    return;
+  pthread_mutex_lock(&source->playout_queue_lock);
+  source->playout_queue_paused = false;
+  pthread_cond_broadcast(&source->playout_queue_changed);
+  pthread_mutex_unlock(&source->playout_queue_lock);
+}
+
+static bool receiver_playout_enqueue(sei_receiver_source_t *source,
+                                     const AVPacket *packet,
+                                     uint64_t received_mono_ns)
+{
+  receiver_queued_packet_t *entry = bzalloc(sizeof(*entry));
+  if (!entry)
+    return false;
+  entry->packet = av_packet_alloc();
+  if (!entry->packet || av_packet_ref(entry->packet, packet) < 0) {
+    av_packet_free(&entry->packet);
+    bfree(entry);
+    return false;
+  }
+  entry->received_mono_ns = received_mono_ns;
+  entry->bytes = packet->size > 0 ? (size_t)packet->size : 0;
+
+  uint64_t input_latency_ns;
+  pthread_mutex_lock(&source->audio_settings_lock);
+  input_latency_ns = source->smoothed_input_latency_ns;
+  pthread_mutex_unlock(&source->audio_settings_lock);
+  double ignored_speed = 1.0;
+  uint64_t group_delay_ns =
+      multicam_status_group_playout_latency_ns(received_mono_ns,
+                                                &ignored_speed);
+  uint64_t wait_ns = receiver_packet_playout_wait_ns(
+      group_delay_ns, input_latency_ns, MAX_SYNC_PLAYOUT_DELAY_NS);
+  entry->release_mono_ns =
+      received_mono_ns > UINT64_MAX - wait_ns
+          ? UINT64_MAX
+          : received_mono_ns + wait_ns;
+
+  pthread_mutex_lock(&source->playout_queue_lock);
+  size_t remaining_bytes = source->playout_queue_bytes >= PLAYOUT_QUEUE_MAX_BYTES
+                               ? 0
+                               : PLAYOUT_QUEUE_MAX_BYTES -
+                                     source->playout_queue_bytes;
+  if (!source->thread_active || source->playout_queue_paused ||
+      source->playout_queue_packets >= PLAYOUT_QUEUE_MAX_PACKETS ||
+      entry->bytes > remaining_bytes) {
+    source->playout_queue_drops++;
+    bool report = source->playout_queue_drops == 1 ||
+                  source->playout_queue_drops % 100 == 0;
+    uint64_t drops = source->playout_queue_drops;
+    pthread_mutex_unlock(&source->playout_queue_lock);
+    av_packet_free(&entry->packet);
+    bfree(entry);
+    if (report)
+      receiver_log(LOG_WARNING, source,
+                   "Bounded playout queue full; packet rejected (drops=%llu)",
+                   (unsigned long long)drops);
+    return false;
+  }
+  if (source->playout_queue_tail)
+    source->playout_queue_tail->next = entry;
+  else
+    source->playout_queue_head = entry;
+  source->playout_queue_tail = entry;
+  source->playout_queue_packets++;
+  source->playout_queue_bytes += entry->bytes;
+  pthread_cond_signal(&source->playout_queue_changed);
+  pthread_mutex_unlock(&source->playout_queue_lock);
+  return true;
+}
+
+static void receiver_realtime_deadline_after(uint64_t wait_ns,
+                                              struct timespec *deadline)
+{
+  timespec_get(deadline, TIME_UTC);
+  /* Recheck at most every 100 ms so sync changes and shutdown are responsive. */
+  if (wait_ns > 100000000ULL)
+    wait_ns = 100000000ULL;
+  deadline->tv_sec += (time_t)(wait_ns / 1000000000ULL);
+  deadline->tv_nsec += (long)(wait_ns % 1000000000ULL);
+  if (deadline->tv_nsec >= 1000000000L) {
+    deadline->tv_sec++;
+    deadline->tv_nsec -= 1000000000L;
+  }
+}
+
+static void *receiver_playout_thread(void *data)
+{
+  sei_receiver_source_t *source = (sei_receiver_source_t *)data;
+  while (true) {
+    pthread_mutex_lock(&source->playout_queue_lock);
+    while (source->thread_active &&
+           (source->playout_queue_paused || !source->playout_queue_head))
+      pthread_cond_wait(&source->playout_queue_changed,
+                        &source->playout_queue_lock);
+    if (!source->thread_active) {
+      receiver_playout_queue_free_locked(source);
+      pthread_cond_broadcast(&source->playout_queue_changed);
+      pthread_mutex_unlock(&source->playout_queue_lock);
+      break;
+    }
+
+    receiver_queued_packet_t *entry = source->playout_queue_head;
+    uint64_t now_ns = os_gettime_ns();
+    if (entry->release_mono_ns > now_ns) {
+      struct timespec deadline;
+      receiver_realtime_deadline_after(entry->release_mono_ns - now_ns,
+                                        &deadline);
+      pthread_cond_timedwait(&source->playout_queue_changed,
+                             &source->playout_queue_lock, &deadline);
+      pthread_mutex_unlock(&source->playout_queue_lock);
+      continue;
+    }
+
+    source->playout_queue_head = entry->next;
+    if (!source->playout_queue_head)
+      source->playout_queue_tail = NULL;
+    source->playout_queue_packets--;
+    source->playout_queue_bytes -= entry->bytes;
+    source->playout_worker_busy = true;
+    pthread_mutex_unlock(&source->playout_queue_lock);
+
+    source->decode_packet_receive_mono_ns = entry->received_mono_ns;
+    if (entry->packet->stream_index == source->video_stream_index) {
+      video_frame_data_t frame = {0};
+      if (decode_and_extract_sei(source, entry->packet, &frame))
+        source->frames_rendered++;
+    } else if (source->audio_stream_index >= 0 &&
+               entry->packet->stream_index == source->audio_stream_index) {
+      decode_audio(source, entry->packet);
+    }
+    source->decode_packet_receive_mono_ns = 0;
+    av_packet_free(&entry->packet);
+    bfree(entry);
+
+    pthread_mutex_lock(&source->playout_queue_lock);
+    source->playout_worker_busy = false;
+    pthread_cond_broadcast(&source->playout_queue_changed);
+    pthread_mutex_unlock(&source->playout_queue_lock);
+  }
+  return NULL;
+}
+
 /* Helper: tear down the connection's resources */
 static void cleanup_connection(sei_receiver_source_t *source) {
+  receiver_playout_pause_and_flush(source);
   if (source->last_video_output_mono_ns)
     clear_output_video(source);
   if (source->format_context) {
@@ -1875,6 +2134,11 @@ static void cleanup_connection(sei_receiver_source_t *source) {
   source->audio_decode_error_streak = 0;
   source->audio_decoder_last_flush_ns = 0;
   source->is_connected = false;
+  pthread_mutex_lock(&source->audio_settings_lock);
+  source->rx_bytes_window = 0;
+  source->rx_bitrate_sample_ns = 0;
+  source->rx_bitrate_bps = 0;
+  pthread_mutex_unlock(&source->audio_settings_lock);
   source->has_pts_offset = false;
   source->pts_offset = 0;
   source->sync_method = SYNC_METHOD_UNKNOWN;
@@ -2086,6 +2350,27 @@ static bool try_connect(sei_receiver_source_t *source) {
 }
 
 /* SRT receive thread (owns connection management and reads) */
+static void receiver_update_bitrate(sei_receiver_source_t *source,
+                                      size_t bytes, uint64_t now_ns)
+{
+  pthread_mutex_lock(&source->audio_settings_lock);
+  source->rx_bytes_total += bytes;
+  source->rx_bytes_window += bytes;
+  if (!source->rx_bitrate_sample_ns)
+    source->rx_bitrate_sample_ns = now_ns;
+  uint64_t elapsed_ns = now_ns >= source->rx_bitrate_sample_ns
+                            ? now_ns - source->rx_bitrate_sample_ns
+                            : 0;
+  if (elapsed_ns >= 1000000000ULL) {
+    source->rx_bitrate_bps =
+        (uint64_t)((long double)source->rx_bytes_window * 8.0L *
+                   1000000000.0L / elapsed_ns);
+    source->rx_bytes_window = 0;
+    source->rx_bitrate_sample_ns = now_ns;
+  }
+  pthread_mutex_unlock(&source->audio_settings_lock);
+}
+
 static void *srt_receive_thread(void *data) {
   sei_receiver_source_t *source = (sei_receiver_source_t *)data;
   receiver_log(LOG_INFO, source, "Thread started (Auto-Reconnect Mode)");
@@ -2104,6 +2389,9 @@ static void *srt_receive_thread(void *data) {
     source->reset_sync_requested = false;
     pthread_mutex_unlock(&source->audio_settings_lock);
 
+    if (reset_sync && !reset_picture) {
+      receiver_playout_pause_and_flush(source);
+    }
     if (reset_picture) {
       receiver_log(LOG_WARNING, source,
                    "Picture reset requested; reconnecting decoder and input");
@@ -2130,11 +2418,14 @@ static void *srt_receive_thread(void *data) {
       multicam_status_set_playout_delay(source, 0);
       receiver_log(LOG_INFO, source,
                    "Synchronization reset requested; waiting for a fresh absolute timestamp");
+      if (source->is_connected)
+        receiver_playout_resume(source);
     }
 
     /* 1. Not connected: try to connect */
     if (!source->is_connected) {
       if (try_connect(source)) {
+        receiver_playout_resume(source);
         /* connected, so enter the read loop */
       } else {
         /* connect failed; wait and retry */
@@ -2161,33 +2452,18 @@ static void *srt_receive_thread(void *data) {
         continue; /* back to the top of the loop, triggering a reconnect */
       }
 
+      uint64_t receive_packet_ns = os_gettime_ns();
+      receiver_update_bitrate(source, (size_t)packet->size,
+                              receive_packet_ns);
       multicam_status_add_packet(source, (size_t)packet->size,
-                                 os_gettime_ns());
+                                 receive_packet_ns);
 
-      /* 3. Handle the packet */
-      static uint64_t video_packet_count = 0;
-      static uint64_t audio_packet_count = 0;
-
-      if (packet->stream_index == source->video_stream_index) {
-        video_packet_count++;
-        if (video_packet_count % 30 == 1) {
-          receiver_log(LOG_INFO, source,
-                       "Video packet received: #%llu, size=%d",
-                       video_packet_count, packet->size);
-        }
-        video_frame_data_t frame = {0};
-        if (decode_and_extract_sei(source, packet, &frame)) {
-          source->frames_rendered++;
-        }
-      } else if (source->audio_stream_index >= 0 &&
-                 packet->stream_index == source->audio_stream_index) {
-        audio_packet_count++;
-        if (audio_packet_count % 300 == 1) {
-          receiver_log(LOG_INFO, source, "Audio packet received: #%llu",
-                       audio_packet_count);
-        }
-        decode_audio(source, packet);
-      }
+      /* Demux quickly, then decode both streams in receive order. Delaying
+       * compressed packets keeps OBS's bounded async video cache near-live. */
+      uint64_t packet_received_ns = os_gettime_ns();
+      if (packet->stream_index == source->video_stream_index ||
+          packet->stream_index == source->audio_stream_index)
+        receiver_playout_enqueue(source, packet, packet_received_ns);
 
       av_packet_unref(packet);
     }
@@ -2208,7 +2484,24 @@ static void start_receiver(void *data) {
 
   receiver_log(LOG_INFO, ctx, "Starting background thread...");
   ctx->thread_active = true;
-  pthread_create(&ctx->receive_thread, NULL, srt_receive_thread, ctx);
+  if (!ctx->playout_thread_running) {
+    if (pthread_create(&ctx->playout_thread, NULL, receiver_playout_thread,
+                       ctx) != 0) {
+      ctx->thread_active = false;
+      receiver_log(LOG_ERROR, ctx, "Failed to start paced playout worker");
+      return;
+    }
+    ctx->playout_thread_running = true;
+  }
+  if (pthread_create(&ctx->receive_thread, NULL, srt_receive_thread, ctx) != 0) {
+    ctx->thread_active = false;
+    pthread_mutex_lock(&ctx->playout_queue_lock);
+    pthread_cond_broadcast(&ctx->playout_queue_changed);
+    pthread_mutex_unlock(&ctx->playout_queue_lock);
+    pthread_join(ctx->playout_thread, NULL);
+    ctx->playout_thread_running = false;
+    receiver_log(LOG_ERROR, ctx, "Failed to start SRT receive worker");
+  }
 }
 
 /* Stop the receiver (stop the thread) */
@@ -2220,7 +2513,14 @@ static void stop_receiver(void *data) {
 
   receiver_log(LOG_INFO, ctx, "Stopping background thread...");
   ctx->thread_active = false;
+  pthread_mutex_lock(&ctx->playout_queue_lock);
+  pthread_cond_broadcast(&ctx->playout_queue_changed);
+  pthread_mutex_unlock(&ctx->playout_queue_lock);
   pthread_join(ctx->receive_thread, NULL);
+  if (ctx->playout_thread_running) {
+    pthread_join(ctx->playout_thread, NULL);
+    ctx->playout_thread_running = false;
+  }
 
   /* Resources are cleaned up at end of thread,
      but we can ensure safety here if needed */
