@@ -86,10 +86,12 @@ int main(void)
    * waits estimates the same media time currently presented by OBS. */
   cameras[0].last_absolute_unix_ns = 101540000000ULL;
   cameras[0].playout_delay_ns = 1540000000ULL;
+  cameras[1].last_absolute_unix_ns = 100000000000ULL;
   cameras[1].playout_delay_ns = 0;
   if (!multicam_status_group_aligned(cameras, 2, now, 16666667ULL, &spread) ||
       spread != 0) return 13;
   cameras[0].last_absolute_unix_ns = 100000000000ULL;
+  cameras[1].last_absolute_unix_ns = 101540000000ULL;
   cameras[0].playout_delay_ns = 0;
   const char *selected_names[] = {"Moblin Camera"};
   if (multicam_status_selected_scene_delay_ns(cameras, 2, selected_names, 1,
