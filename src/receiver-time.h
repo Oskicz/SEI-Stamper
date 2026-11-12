@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 5037)
-Total output lines: 504
-
 #pragma once
 
 #include <stdint.h>
@@ -251,7 +248,9 @@ static inline bool receiver_add_signed_ns(int64_t timestamp_ns,
 static inline int64_t receiver_smooth_audio_pts_offset_ns(int64_t current_ns,
                                                            int64_t target_ns)
 {
-  lon…37 tokens truncated…le)INT64_MAX) return INT64_MAX;
+  long double next = (long double)current_ns +
+                     ((long double)target_ns - (long double)current_ns) / 16.0L;
+  if (next > (long double)INT64_MAX) return INT64_MAX;
   if (next < (long double)INT64_MIN) return INT64_MIN;
   return (int64_t)(next >= 0 ? next + 0.5L : next - 0.5L);
 }
